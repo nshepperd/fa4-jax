@@ -11,8 +11,9 @@ data.
 Kernel-side restrictions surface here as NotImplementedError:
 
 - backward (reverse mode): no GQA (upstream's dK/dV accumulation assumes
-  qhead_per_kvhead == 1 here), no mask_mod (upstream SM80 backward predates
-  it), no lse cotangent. The JVP tangent kernel supports all three.
+  qhead_per_kvhead == 1 here) and no lse cotangent; mask_mod works (a local
+  addition to the vendored backward). The JVP tangent kernel supports all of
+  it.
 - fp16/bf16 only, head_dim % 8 == 0 (validated with clear errors).
 
 Layout note (from fa4.py): heads and head_dim are baked into the kernel (they
@@ -71,6 +72,36 @@ def _cute_mask_mod(mask: MaskMod):
         return scalar_to_ssa(pred, cutlass.Boolean)
 
     return mod
+
+
+@functools.cache
+def _folded_mask_mod(mask_mod: MaskMod, causal: bool, wl, wr) -> MaskMod:
+    """AND native causal/window semantics into a mask predicate.
+
+    The SM80/SM120 kernels' AttentionMask applies either the causal/local
+    band *or* a mask_mod, never both, so when a mask_mod is present the
+    native options must ride inside the predicate. Cached so the folded
+    MaskMod is identity-stable (it is a compile-cache key).
+    """
+    from fa4_jax.masks import and_masks, causal_mask, sliding_window_mask
+
+    parts = []
+    if causal:
+        parts.append(causal_mask())
+    elif wl is not None or wr is not None:
+        parts.append(sliding_window_mask(wl, wr))
+    return and_masks(*parts, mask_mod) if parts else mask_mod
+
+
+def _kernel_mask_view(cfg: AttnConfig):
+    """(causal, local, wl, wr, mask_mod) as the kernels should see them."""
+    causal, local, (wl, wr) = cfg.causal, cfg.local, cfg.window
+    mod = cfg.mask_mod
+    if mod is not None and (causal or local):
+        mod = _folded_mask_mod(mod, causal, wl, wr)
+        causal = local = False
+        wl = wr = None
+    return causal, local, wl, wr, mod
 
 
 # ---------------------------------------------------------------- forward
@@ -203,7 +234,7 @@ def _bwd_kernel_cls(arch: int):
 
 
 @functools.cache
-def _get_bwd(dtype, head_dim, head_dim_v, causal, local, arch):
+def _get_bwd(dtype, head_dim, head_dim_v, causal, local, mask_mod, n_aux, arch):
     stages = 2 if head_dim <= 64 else 1
     return _bwd_kernel_cls(arch)(
         dtype,
@@ -225,6 +256,8 @@ def _get_bwd(dtype, head_dim, head_dim_v, causal, local, arch):
         _BWD_ATOM_LAYOUT,  # AtomLayoutNdKV
         _BWD_ATOM_LAYOUT,  # AtomLayoutMdQ
         V_in_regs=False,
+        mask_mod=None if mask_mod is None else _cute_mask_mod(mask_mod),
+        has_aux_tensors=n_aux > 0,
     )
 
 
@@ -255,11 +288,14 @@ def _fa4_bwd_pre(stream, tree, mO, mdO, mLSE, mPdPsum, mLSElog2, mdQaccum):
 
 
 @cute.jit
-def _fa4_bwd(stream, tree, mQ, mK, mV, mdO, mLSElog2, mPdPsum, _mdQaccum_in, mdQaccum, mdK, mdV):
+def _fa4_bwd(stream, tree, mQ, mK, mV, mdO, mLSElog2, mPdPsum, _mdQaccum_in, aux, mdQaccum, mdK, mdV):
     # dQaccum is passed twice: once as the input holding the zeros preprocess
     # wrote, once as an output. `input_output_aliases` makes XLA hand both
     # names the same buffer, which is what lets the kernel accumulate dQ in
-    # place across n-blocks.
+    # place across n-blocks. `aux` is the (possibly empty) tuple of mask_mod
+    # aux tensors.
+    from fa4_jax.cute.utils import AuxData
+
     wl, wr = _windows(tree)
     tree["bwd"](
         mQ, mK, mV, mdO, mLSElog2, mPdPsum, mdQaccum, mdK, mdV,
@@ -267,6 +303,7 @@ def _fa4_bwd(stream, tree, mQ, mK, mV, mdO, mLSElog2, mPdPsum, _mdQaccum_in, mdQ
         None, None, None, None,  # cu_seqlens_q/k, seqused_q/k
         window_size_left=wl,
         window_size_right=wr,
+        aux_data=AuxData(tensors=aux) if cutlass.const_expr(len(aux) > 0) else AuxData(),
         stream=stream,
     )
 
@@ -331,22 +368,30 @@ class _StaticDict(dict):
 @functools.cache
 def _get_static(cfg: AttnConfig, dtype, head_dim, head_dim_v, qhead_per_kvhead, arch, kind):
     """The static part of the call tree for (variant, kind); kind picks which
-    kernel objects exist so unused ones are never built or compiled."""
-    wl, wr = cfg.window
+    kernel objects exist so unused ones are never built or compiled.
+
+    With a mask_mod present, native causal/window options are folded into the
+    predicate (see _kernel_mask_view) -- the kernels' AttentionMask cannot
+    apply both, and would otherwise silently drop the mod. The cost is the
+    causal/local block skipping, which mask mods don't get anyway.
+    """
+    causal, local, wl, wr, mask_mod = _kernel_mask_view(cfg)
     st = _StaticDict(scale=cfg.scale, wl=wl, wr=wr, n_aux=cfg.n_aux)
     if kind == "fwd":
         st["fa"] = _get_fwd(
             dtype, head_dim, head_dim_v, qhead_per_kvhead,
-            cfg.causal, cfg.local, cfg.mask_mod, cfg.n_aux, arch,
+            causal, local, mask_mod, cfg.n_aux, arch,
         )
     elif kind == "bwd":
-        st["bwd"] = _get_bwd(dtype, head_dim, head_dim_v, cfg.causal, cfg.local, arch)
+        st["bwd"] = _get_bwd(
+            dtype, head_dim, head_dim_v, causal, local, mask_mod, cfg.n_aux, arch
+        )
         st["pre"] = _get_bwd_pre(dtype, head_dim, head_dim_v)
         st["post"] = _get_bwd_post(dtype, head_dim, arch)
     elif kind == "jvp":
         st["jvp"] = _get_jvp(
             dtype, head_dim, head_dim_v, qhead_per_kvhead,
-            cfg.causal, cfg.local, cfg.mask_mod, cfg.n_aux, arch,
+            causal, local, mask_mod, cfg.n_aux, arch,
         )
     return st
 
@@ -422,12 +467,6 @@ class CuteBackend:
         )
 
     def vjp(self, cfg, q, k, v, out, lse, d_out, d_lse, aux):
-        if cfg.mask_mod is not None:
-            raise NotImplementedError(
-                "reverse mode with a mask_mod: upstream's SM80/SM120 backward kernel "
-                "has no mask_mod support. Use backend='reference', or forward-mode "
-                "differentiation (jax.jvp / jax.jacfwd), which supports mask mods."
-            )
         if q.shape[2] != k.shape[2]:
             raise NotImplementedError(
                 "fa4 backward does not support GQA (it would need a dK/dV accumulator "
@@ -468,8 +507,8 @@ class CuteBackend:
                 jax.ShapeDtypeStruct(k.shape, k.dtype),
                 jax.ShapeDtypeStruct(v.shape, v.dtype),
             ],
-            st, q, k, v, d_out, lse_log2, dpsum, dq_accum,
-            in_specs=[_QKV_SPEC] * 4 + [_F32_SPEC] * 3,
+            st, q, k, v, d_out, lse_log2, dpsum, dq_accum, tuple(aux),
+            in_specs=[_QKV_SPEC] * 4 + [_F32_SPEC] * 3 + [None] * len(aux),
             out_specs=[_F32_SPEC, _QKV_SPEC, _QKV_SPEC],
             input_output_aliases={6: 0},
             name="fa4_bwd",

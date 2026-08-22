@@ -12,6 +12,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass import Int32
+from cutlass.cute import FastDivmodDivisor
 import cutlass.utils as utils_basic
 
 from quack import layout_utils
@@ -52,6 +53,8 @@ class FlashAttentionBackwardSm80:
         V_in_regs: bool = False,
         score_mod: cutlass.Constexpr | None = None,
         score_mod_bwd: cutlass.Constexpr | None = None,
+        mask_mod: cutlass.Constexpr | None = None,
+        has_aux_tensors: bool = False,
     ):
         """Initializes the configuration for a flash attention v2 kernel.
 
@@ -100,6 +103,22 @@ class FlashAttentionBackwardSm80:
         self.share_QV_smem = V_in_regs
         self.score_mod = score_mod
         self.score_mod_bwd = score_mod_bwd
+        # fa4-jax: flex-attention mask_mod, applied to the recomputed S before
+        # the exp (masked -> -inf -> P = 0 -> dS = 0). Combining with
+        # is_causal/is_local is not supported here -- the causal/local branch
+        # of AttentionMask.apply_mask ignores mask_mod -- so callers must fold
+        # native masks into the predicate (fa4_jax.kernels does).
+        self.mask_mod = mask_mod
+        self.has_aux_tensors = has_aux_tensors
+        if mask_mod is not None:
+            assert not (is_causal or is_local), (
+                "mask_mod with is_causal/is_local would silently drop the mod; "
+                "fold causal/local into the mask predicate instead"
+            )
+            assert not SdP_swapAB, "mask_mod assumes the (m, n) accumulator orientation"
+            assert getattr(mask_mod, "__vec_size__", 1) == 1, (
+                "mask_mod vec_size > 1 not supported on Sm80/120"
+            )
 
     @staticmethod
     def can_implement(
@@ -444,6 +463,15 @@ class FlashAttentionBackwardSm80:
         softmax_scale_log2, _ = utils.compute_softmax_scale_log2(
             softmax_scale, self.score_mod
         )
+        # fa4-jax: (seqlen_q, seqlen_k) divisors so apply_mask can wrap the
+        # mod's aux indices on out-of-range tail rows/cols (the seqlen mask
+        # then discards those entries). Tensors here are still
+        # (batch, seqlen, head, dim), unlike the forward's transposed view,
+        # so utils.compute_fastdiv_mods (which reads shape[0]) doesn't apply.
+        if cutlass.const_expr(self.mask_mod is not None and aux_data.tensors is not None):
+            fastdiv_mods = (FastDivmodDivisor(mQ.shape[1]), FastDivmodDivisor(mK.shape[1]))
+        else:
+            fastdiv_mods = None
         self.kernel(
             mQ,
             mK,
@@ -482,6 +510,7 @@ class FlashAttentionBackwardSm80:
             tile_sched_params,
             TileScheduler,
             aux_data,
+            fastdiv_mods,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -529,6 +558,7 @@ class FlashAttentionBackwardSm80:
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
         aux_data: AuxData = AuxData(),
+        fastdiv_mods=None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
@@ -847,7 +877,9 @@ class FlashAttentionBackwardSm80:
                 mask_fn = partial(
                     mask.apply_mask, n_block=n_block, thr_mma=thr_mma_sdp,
                     batch_idx=batch_idx, head_idx=head_idx,
-                    mask_seqlen=True, mask_causal=self.is_causal, mask_local=self.is_local
+                    mask_seqlen=True, mask_causal=self.is_causal, mask_local=self.is_local,
+                    mask_mod=self.mask_mod, aux_data=aux_data,
+                    fastdiv_mods=fastdiv_mods if cutlass.const_expr(self.mask_mod is not None) else None,
                 )
                 smem_pipe_read_q = cutlass.Int32(0)
                 smem_pipe_read_do = cutlass.Int32(0)

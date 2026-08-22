@@ -33,9 +33,11 @@ out, lse = flash_attn(q, k, v, return_lse=True)
 ```
 
 Restrictions (kernel-side, all checked with clear errors): fp16/bf16, head_dim
-a multiple of 8, GQA forward-only (repeat kv heads for gradients), mask_mod
-gradients need the reference backend (upstream's SM80 backward has no
-mask_mod support yet); JVP supports both.
+a multiple of 8, GQA forward-and-JVP-only (repeat kv heads for reverse-mode
+gradients). Mask mods work in all three passes — the backward's mask_mod
+support is a local addition to the vendored kernel. Combining
+causal/window_size with a mask_mod folds the native mask into the predicate
+(correct, but forfeits the native paths' block skipping).
 
 ## Layout
 

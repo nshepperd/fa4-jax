@@ -183,10 +183,63 @@ def test_grad_gqa_raises():
         jax.grad(lambda q: flash_attn(q, k, v, backend="cute").sum())(q)
 
 
-def test_grad_mask_mod_raises():
-    q, k, v = _mk((1, 64, 64, 1, 1, 64, None), jnp.bfloat16)
-    with pytest.raises(NotImplementedError, match="mask_mod"):
-        jax.grad(lambda q: flash_attn(q, k, v, mask_mod=_CAUSAL_MM, backend="cute").sum())(q)
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_grad_mask_mod(dtype):
+    """mask_mod in reverse mode (local addition to the vendored backward)."""
+    q, k, v = _mk((2, 160, 160, 2, 1, 64, None), dtype)
+
+    def loss(backend):
+        return lambda q, k, v: flash_attn(q, k, v, mask_mod=_WINDOW_MM, backend=backend).sum()
+
+    got = jax.grad(loss("cute"), argnums=(0, 1, 2))(q, k, v)
+    want = jax.grad(loss("reference"), argnums=(0, 1, 2))(q, k, v)
+    for g, w, name in zip(got, want, "qkv"):
+        assert_close(g, w, dtype=dtype, msg=f"d{name}")
+
+
+def test_grad_mask_mod_aux():
+    s = 192
+    q, k, v = _mk((2, s, s, 2, 1, 64, None), jnp.bfloat16)
+    ids = jnp.asarray(np.repeat(np.arange(4), s // 4))[None].repeat(2, 0).astype(jnp.int32)
+
+    def loss(backend):
+        return lambda q, k, v: flash_attn(
+            q, k, v, mask_mod=_DOC_MM, aux_tensors=(ids,), backend=backend
+        ).sum()
+
+    got = jax.grad(loss("cute"), argnums=(0, 1, 2))(q, k, v)
+    want = jax.grad(loss("reference"), argnums=(0, 1, 2))(q, k, v)
+    for g, w in zip(got, want):
+        assert_close(g, w, dtype=q.dtype)
+
+
+@pytest.mark.parametrize("native", [dict(causal=True), dict(window_size=(48, 16))])
+def test_native_mask_combines_with_mask_mod(native):
+    """causal/window + mask_mod fold into one predicate on the kernels
+    (regression: the kernels' AttentionMask would otherwise silently drop the
+    mod). Checked for fwd, grad, and jvp."""
+    s = 160
+    q, k, v = _mk((2, s, s, 2, 1, 64, None), jnp.bfloat16)
+    ids = jnp.asarray(np.repeat(np.arange(4), s // 4))[None].repeat(2, 0).astype(jnp.int32)
+    kw = dict(mask_mod=_DOC_MM, aux_tensors=(ids,), **native)
+
+    got, want = _both(q, k, v, **kw)
+    assert_close(got, want, dtype=q.dtype, msg="fwd")
+
+    def loss(backend):
+        return lambda q, k, v: flash_attn(q, k, v, backend=backend, **kw).sum()
+
+    gg = jax.grad(loss("cute"), argnums=(0, 1, 2))(q, k, v)
+    gw = jax.grad(loss("reference"), argnums=(0, 1, 2))(q, k, v)
+    for g, w in zip(gg, gw):
+        assert_close(g, w, dtype=q.dtype, msg="grad")
+
+    rng = np.random.default_rng(9)
+    dq, dk, dv = (jnp.asarray(rng.standard_normal(t.shape), q.dtype) for t in (q, k, v))
+    f = lambda backend: lambda q, k, v: flash_attn(q, k, v, backend=backend, **kw)
+    _, t_got = jax.jvp(f("cute"), (q, k, v), (dq, dk, dv))
+    _, t_want = jax.jvp(f("reference"), (q, k, v), (dq, dk, dv))
+    assert_close(t_got, t_want, dtype=q.dtype, msg="jvp tangent")
 
 
 # ---------------------------------------------------------------- jvp
