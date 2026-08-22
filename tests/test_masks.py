@@ -131,3 +131,31 @@ def test_aux_values_are_runtime_data():
     o1 = flash_attn(q, k, v, mask_mod=mm, aux_tensors=(ids1,), backend="reference")
     o2 = flash_attn(q, k, v, mask_mod=mm, aux_tensors=(ids2,), backend="reference")
     assert np.abs(np.asarray(o1 - o2, dtype=np.float32)).max() > 1e-3
+
+
+def test_folded_mask_mod_matches_native_semantics():
+    """The cute backend folds causal/window into the predicate when a
+    mask_mod is present (kernels.py); the folded predicate must equal the
+    native mask ANDed with the mod. Evaluated densely, so this covers the
+    GPU-side folding logic without a GPU."""
+    # kernels.py imports cutejax/cutlass at module level, but the folding
+    # helpers only need masks.py machinery.
+    from fa4_jax.kernels import _folded_mask_mod
+
+    mod = document_mask()
+    ids = jnp.asarray([[0, 0, 0, 1, 1, 2, 2, 2, 2]])
+    b, h, s = 1, 2, 9
+
+    def dense(mask_mod, causal, window):
+        return np.asarray(dense_mask(b, h, s, s, causal, window, mask_mod, (ids,)))
+
+    for causal, window in [(True, (None, 0)), (False, (4, 2)), (False, (None, 3))]:
+        wl, wr = window
+        folded = _folded_mask_mod(mod, causal, wl, wr)
+        got = dense(folded, False, (None, None))
+        want = dense(mod, causal, window)
+        np.testing.assert_array_equal(got, want, err_msg=f"causal={causal} window={window}")
+
+    # identity-stable: the folded object is a kernel compile-cache key
+    assert _folded_mask_mod(mod, True, None, 0) is _folded_mask_mod(mod, True, None, 0)
+    assert _folded_mask_mod(mod, False, 4, 2) is not _folded_mask_mod(mod, False, 4, 3)
