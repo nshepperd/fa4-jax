@@ -9,17 +9,18 @@ What it provides over `jax.nn.dot_product_attention`:
 - **Native two-sided sliding windows** — `window_size=(left, right)` takes the
   kernel's local path and *skips* out-of-band KV blocks (cuDNN's fused kernel
   only takes a left window).
-- **Flex-attention mask mods** — a `MaskMod` predicate is baked into the
-  kernel as code via cutejax's static-pytree-leaf codegen; aux tensors (e.g.
-  document ids) stay runtime data, so new values reuse the compiled kernel.
+- **Flex-attention mask mods** — a `MaskMod` is a callable pytree: its class
+  and `static()` fields are baked into the kernel as code via cutejax's
+  static-pytree-leaf codegen; its array fields (e.g. document ids) stay
+  runtime data, so new values reuse the compiled kernel.
 - **Both differentiation modes** — reverse mode runs FA4's backward kernels;
   forward mode (`jax.jvp` / `jax.linearize`) runs a fused tangent kernel
   (`fa4_jax/cute/flash_jvp.py`, ours — upstream has no JVP). Built on custom
   primitives with a linear tangent + transpose rule, not `jax.custom_vjp`,
   which would forbid forward mode.
 - **A pure-JAX reference backend** with identical semantics (including the
-  differentiation wiring), so everything above the kernels is unit-tested on
-  CPU, and `flash_attn(..., backend="reference")` works anywhere.
+  differentiation wiring) — the ground truth the kernels are tested against,
+  and `flash_attn(..., backend="reference")` works anywhere.
 
 ```python
 import jax.numpy as jnp
@@ -27,9 +28,23 @@ from fa4_jax import flash_attn, document_mask
 
 out = flash_attn(q, k, v, causal=True)                       # (b, s, h, d) bf16/fp16
 out = flash_attn(q, k, v, window_size=(128, 128))            # two-sided local
-out = flash_attn(q, k, v, mask_mod=document_mask(),          # flex: block-diag by id
-                 aux_tensors=(doc_ids,))                     # (b, s) int32
+out = flash_attn(q, k, v, mask_mod=document_mask(doc_ids))   # flex: block-diag by (b, s) int32 id
 out, lse = flash_attn(q, k, v, return_lse=True)
+```
+
+Custom masks are frozen dataclasses subclassing `MaskMod`; array fields are
+pytree leaves (runtime), anything else is declared `static()`:
+
+```python
+from dataclasses import dataclass
+from fa4_jax import MaskMod, static
+
+@dataclass(frozen=True)
+class PrefixLM(MaskMod):
+    prefix_len: jax.Array          # (b,) runtime data
+    window: int = static()         # compile-time constant
+    def __call__(self, b, h, q, kv):
+        return (kv < self.prefix_len[b]) | ((kv <= q) & (q - kv <= self.window))
 ```
 
 Restrictions (kernel-side, all checked with clear errors): fp16/bf16, head_dim
@@ -54,6 +69,8 @@ block sparsity, which is not wired up.
 ## Tests
 
 ```sh
-uv run pytest              # CPU: reference vs jax.nn.dot_product_attention, wiring, hypothesis shapes
-uv run pytest -m gpu       # kernels vs reference, on a CUDA device
+uv run pytest              # kernels vs the jnp reference (fwd/grad/jvp/masks) + API checks; needs a CUDA device
 ```
+
+`conftest.py` sets `XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async` and
+`XLA_PYTHON_CLIENT_MEM_FRACTION=0.4` so the suite shares the GPU.

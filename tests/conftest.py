@@ -1,20 +1,16 @@
 from __future__ import annotations
 
+import os
+
+# Share the GPU with whatever else is running: grow allocations on demand
+# instead of preallocating, and cap the pool. Must be set before jax imports.
+os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "cuda_async")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.4")
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from hypothesis import HealthCheck, settings
-
-# JIT compilation makes per-example timing meaningless; hypothesis must not
-# flag slow examples or shrink on deadline.
-settings.register_profile(
-    "fa4",
-    deadline=None,
-    max_examples=25,
-    suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
-)
-settings.load_profile("fa4")
 
 
 def has_cuda() -> bool:
@@ -25,12 +21,12 @@ def has_cuda() -> bool:
 
 
 def pytest_collection_modifyitems(config, items):
+    # The whole suite exercises the cute backend (or compares against it).
     if has_cuda():
         return
     skip = pytest.mark.skip(reason="no CUDA device")
     for item in items:
-        if "gpu" in item.keywords:
-            item.add_marker(skip)
+        item.add_marker(skip)
 
 
 TOL = {

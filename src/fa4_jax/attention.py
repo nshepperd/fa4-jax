@@ -45,18 +45,26 @@ __all__ = ["flash_attn"]
 class AttnConfig:
     """Static description of one attention variant; a primitive param, so hashable.
 
-    ``mask_mod`` hashes by identity (MaskMod is ``eq=False``), making each
-    distinct mask object a distinct kernel-cache key — that identity is what
-    cutejax uses to key the generated code.
+    ``mask`` is the mask mod's *treedef* — its class and static fields — so
+    masks of the same kind with different array contents compare equal and
+    share a kernel; the array leaves travel as primitive operands (``aux``)
+    and ``mask.unflatten(aux)`` rebuilds the callable inside a backend.
     """
 
     causal: bool
     local: bool
     window: tuple[int | None, int | None]
     scale: float
-    mask_mod: MaskMod | None
-    n_aux: int
+    mask: jax.tree_util.PyTreeDef | None
     backend: str
+
+    @property
+    def n_aux(self) -> int:
+        return 0 if self.mask is None else self.mask.num_leaves
+
+    def mask_mod(self, aux) -> MaskMod | None:
+        """Rebuild the mask callable from this config and its leaves."""
+        return None if self.mask is None else self.mask.unflatten(tuple(aux))
 
 
 class Backend(Protocol):
@@ -127,7 +135,7 @@ def _fwd_jvp(primals, tangents, *, cfg: AttnConfig, need_lse: bool):
     q, k, v, *aux = primals
     dq, dk, dv, *daux = tangents
     if any(not isinstance(t, ad.Zero) for t in daux):
-        raise NotImplementedError("fa4 aux tensors are not differentiable")
+        raise NotImplementedError("fa4 mask_mod array fields (aux data) are not differentiable")
     out, lse = fa4_fwd_p.bind(q, k, v, *aux, cfg=cfg, need_lse=True)
     dq, dk, dv = (
         ad.instantiate_zeros(t) if isinstance(t, ad.Zero) else t for t in (dq, dk, dv)
@@ -182,7 +190,7 @@ mlir.register_lowering(fa4_tangent_p, mlir.lower_fun(_tangent_impl, multiple_res
 # the graph (jacfwd, vmap-of-grad, ...) and maps onto the kernels' batch
 # parallelism directly.
 #
-# A mask_mod (or its aux tensors) can depend on the batch index, which
+# A mask_mod (or its array leaves) can depend on the batch index, which
 # folding would renumber; those fall back to vmapping the impl instead —
 # semantically right, but it differentiates through the backend's jnp code
 # rather than the primitives, so on the cute backend it is unsupported.
@@ -208,13 +216,13 @@ def _batch_via_impl(impl, args, dims, **params):
 
 
 def _fwd_batch(args, dims, *, cfg: AttnConfig, need_lse: bool):
-    if cfg.mask_mod is None and cfg.n_aux == 0:
+    if cfg.mask is None:
         return _batch_via_fold(fa4_fwd_p, args, dims, cfg=cfg, need_lse=need_lse)
     return _batch_via_impl(_fwd_impl, args, dims, cfg=cfg, need_lse=need_lse)
 
 
 def _tangent_batch(args, dims, *, cfg: AttnConfig):
-    if cfg.mask_mod is None and cfg.n_aux == 0:
+    if cfg.mask is None:
         return _batch_via_fold(fa4_tangent_p, args, dims, cfg=cfg)
     return _batch_via_impl(_tangent_impl, args, dims, cfg=cfg)
 
@@ -256,7 +264,6 @@ def flash_attn(
     window_size: tuple[int | None, int | None] | None = None,
     scale: float | None = None,
     mask_mod: MaskMod | None = None,
-    aux_tensors: tuple[Array, ...] = (),
     return_lse: bool = False,
     backend: str | None = None,
 ):
@@ -274,11 +281,12 @@ def flash_attn(
             unbounded. Combines with ``causal``. Out-of-band KV blocks are
             *skipped*, not masked.
         scale: softmax scale, default ``1/sqrt(head_dim)``.
-        mask_mod: a :class:`fa4_jax.MaskMod` flex-attention predicate, baked
-            into the kernel as code (one compiled kernel per mask object).
-            Combines (AND) with ``causal``/``window_size``.
-        aux_tensors: runtime data the mask predicate may index; changing aux
-            *values* reuses the compiled kernel. Not differentiable.
+        mask_mod: a :class:`fa4_jax.MaskMod` flex-attention predicate — a
+            callable pytree. Its class and static fields are baked into the
+            kernel as code (one compiled kernel per mask *kind*); its array
+            fields are runtime data, so new contents reuse the kernel. Not
+            differentiable through those arrays. Combines (AND) with
+            ``causal``/``window_size``.
         return_lse: also return the row log-sum-exp ``(batch, heads, q_seq)``
             (float32, natural log; ``-inf`` for rows with no visible key).
         backend: ``"cute"`` (FA4 kernels, CUDA), ``"reference"`` (plain jnp),
@@ -300,12 +308,21 @@ def flash_attn(
         raise ValueError(f"q/k head_dim mismatch: {q.shape[3]} vs {k.shape[3]}")
     if q.shape[2] % k.shape[2]:
         raise ValueError(f"q heads {q.shape[2]} not a multiple of kv heads {k.shape[2]}")
-    aux_tensors = tuple(aux_tensors)
     if mask_mod is not None and not isinstance(mask_mod, MaskMod):
         raise TypeError(
-            "mask_mod must be a fa4_jax.MaskMod (a raw cute-jit callable can't "
-            "run on the reference backend; wrap the predicate in MaskMod)"
+            "mask_mod must be a fa4_jax.MaskMod (a raw callable can't run on "
+            "the reference backend; wrap the predicate in fa4_jax.FnMask)"
         )
+    aux_tensors, mask_def = jax.tree.flatten(mask_mod)
+    for leaf in aux_tensors:
+        if not hasattr(leaf, "shape") or not hasattr(leaf, "dtype"):
+            raise TypeError(
+                f"mask_mod field holds {leaf!r}, which is not an array. Non-array "
+                "fields must be declared static (fa4_jax.masks.static()) so they "
+                "live in the treedef rather than becoming traced operands."
+            )
+    if mask_mod is None:
+        mask_def = None
 
     left, right = window_size if window_size is not None else (None, None)
     causal, local, wl, wr = _resolve_causal_local_window(
@@ -316,8 +333,7 @@ def flash_attn(
         local=local,
         window=(wl, wr),
         scale=float(scale if scale is not None else 1.0 / math.sqrt(q.shape[3])),
-        mask_mod=mask_mod,
-        n_aux=len(aux_tensors),
+        mask=mask_def,
         backend=backend if backend is not None else _default_backend(),
     )
     res = fa4_fwd_p.bind(q, k, v, *aux_tensors, cfg=cfg, need_lse=return_lse)

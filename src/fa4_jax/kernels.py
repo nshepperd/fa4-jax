@@ -1,12 +1,12 @@
 """The cute backend: vendored FA4 kernels driven through cutejax.
 
 A port of minimax-music3's fa4.py restructured behind the Backend protocol,
-plus flex-attention mask mods: the MaskMod predicate is wrapped into a
-``@cute.jit`` callable (scalar Int32 indices in, Boolean SSA out) and handed
-to the kernel constructor, so it becomes codegen; the kernel-config dict rides
-the cutejax pytree as an identity-hashed static leaf, making each distinct
-MaskMod object its own compile-cache entry while aux tensors stay runtime
-data.
+plus flex-attention mask mods: the MaskMod (a callable pytree) arrives as its
+treedef plus a tuple of array leaves; the treedef is wrapped into a
+``@cute.jit`` callable that rebuilds the mask with the kernel's CuTe aux
+tensors as leaves and calls it (scalar Int32 indices in, Boolean SSA out), so
+the predicate becomes codegen keyed by the mask's class + static fields,
+while its array fields stay runtime data.
 
 Kernel-side restrictions surface here as NotImplementedError:
 
@@ -56,19 +56,25 @@ def _device_arch() -> int:
 
 
 @functools.cache
-def _cute_mask_mod(mask: MaskMod):
-    """Stage a MaskMod predicate as the cute callable the kernels expect.
+def _cute_mask_mod(mask_def: jax.tree_util.PyTreeDef):
+    """Stage a MaskMod treedef as the cute callable the kernels expect.
 
-    The kernels hand the predicate size-1 SSA vectors; the MaskMod contract is
-    scalar indices and a scalar Boolean, so scalarize on the way in and re-wrap
-    on the way out. Cached per MaskMod identity: the returned function object
-    is baked into kernel configs and must be stable.
+    The kernel's aux tensors are the mask's array leaves in flatten order, so
+    unflattening them through the treedef yields the mask with CuTe tensors
+    in its array fields. The kernels hand the predicate size-1 SSA vectors;
+    the MaskMod contract is scalar indices and a scalar Boolean, so scalarize
+    on the way in and re-wrap on the way out. Cached per treedef (class +
+    static fields): the returned function object is baked into kernel configs
+    and must be stable.
     """
     from fa4_jax.cute.utils import scalar_to_ssa
 
     @cute.jit
     def mod(batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
-        pred = mask.fn(batch_idx[0], head_idx[0], q_idx[0], kv_idx[0], aux_tensors)
+        # aux_tensors is None (not ()) when the kernel has has_aux_tensors=False.
+        leaves = () if aux_tensors is None else tuple(aux_tensors)
+        mask: MaskMod = mask_def.unflatten(leaves)
+        pred = mask(batch_idx[0], head_idx[0], q_idx[0], kv_idx[0])
         return scalar_to_ssa(pred, cutlass.Boolean)
 
     return mod
@@ -346,7 +352,7 @@ def _get_static(cfg: AttnConfig, dtype, head_dim, head_dim_v, qhead_per_kvhead, 
     the vendored mask.py -- upstream's branch structure would silently drop
     the mod in that combination).
     """
-    causal, local, (wl, wr), mask_mod = cfg.causal, cfg.local, cfg.window, cfg.mask_mod
+    causal, local, (wl, wr), mask_mod = cfg.causal, cfg.local, cfg.window, cfg.mask
     st = _StaticDict(scale=cfg.scale, wl=wl, wr=wr, n_aux=cfg.n_aux)
     if kind == "fwd":
         st["fa"] = _get_fwd(

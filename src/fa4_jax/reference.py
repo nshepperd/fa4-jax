@@ -38,7 +38,6 @@ def dense_mask(
     causal: bool,
     window: tuple[int | None, int | None],
     mask_mod: MaskMod | None,
-    aux: tuple[Array, ...],
 ) -> Bool[Array, "batch heads s_q s_kv"] | None:
     """The combined visibility mask as a dense boolean, or None if all-visible."""
     q = jnp.arange(s_q)[:, None]
@@ -60,7 +59,7 @@ def dense_mask(
     if mask_mod is not None:
         b = jnp.arange(batch)[:, None, None, None]
         h = jnp.arange(heads)[None, :, None, None]
-        mm = mask_mod.fn(b, h, q[None, None], kv[None, None], aux)
+        mm = mask_mod(b, h, q[None, None], kv[None, None])
         mm = jnp.broadcast_to(mm, (batch, heads, s_q, s_kv))
         mask = mm if mask is None else mask & mm
     return mask
@@ -159,7 +158,6 @@ def reference_attn(
     window_size: tuple[int | None, int | None] | None = None,
     scale: float | None = None,
     mask_mod: MaskMod | None = None,
-    aux_tensors: tuple[Array, ...] = (),
     return_lse: bool = False,
 ):
     """Reference attention with the exact semantics of ``fa4_jax.flash_attn``.
@@ -171,7 +169,7 @@ def reference_attn(
     s_kv = k.shape[1]
     scale = float(scale if scale is not None else 1.0 / math.sqrt(q.shape[-1]))
     window = window_size if window_size is not None else (None, None)
-    mask = dense_mask(b, h_q, s_q, s_kv, causal, window, mask_mod, aux_tensors)
+    mask = dense_mask(b, h_q, s_q, s_kv, causal, window, mask_mod)
     qf = q.astype(jnp.float32)
     kf = _expand_kv(k, h_q).astype(jnp.float32)
     vf = _expand_kv(v, h_q).astype(jnp.float32)

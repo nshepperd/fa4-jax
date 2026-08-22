@@ -18,7 +18,7 @@ class ReferenceBackend:
     def _mask(self, cfg, q, k, aux):
         return ref.dense_mask(
             q.shape[0], q.shape[2], q.shape[1], k.shape[1],
-            cfg.causal, cfg.window, cfg.mask_mod, aux,
+            cfg.causal, cfg.window, cfg.mask_mod(aux),
         )
 
     def _expand(self, cfg, q, k, v):

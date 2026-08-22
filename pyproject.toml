@@ -30,7 +30,6 @@ override-dependencies = ["nvidia-cutlass-dsl>=4.7"]
 [dependency-groups]
 dev = [
     "pytest>=8",
-    "hypothesis>=6.100",
 ]
 
 [build-system]
@@ -43,9 +42,6 @@ packages = ["src/fa4_jax"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
-markers = [
-    "gpu: needs a CUDA device (sm_80+ for the FA4 kernels); deselect with -m 'not gpu'",
-]
 
 [tool.ruff.lint]
 # jaxtyping shape-string annotations trip F722/F821/UP037. C408: dict(...) is

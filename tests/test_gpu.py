@@ -1,11 +1,10 @@
-"""GPU suite: the cute backend (vendored FA4 kernels + our JVP tangent
-kernel) against the reference backend, which the CPU suite has already pinned
-to jax.nn.dot_product_attention and plain-JAX autodiff.
+"""Kernel suite: the cute backend (vendored FA4 kernels + our JVP tangent
+kernel) against the plain-jnp reference backend, for values, gradients and
+JVPs.
 
-Run with `pytest -m gpu` on a machine with a CUDA device (sm_80+ family;
-sm_86/sm_120 are what this repo targets). Kernel compiles are cached per
-(head config, mask object), so the parametrized sweeps mostly reuse a handful
-of compiles.
+Needs a CUDA device (sm_80+ family; sm_86/sm_120 are what this repo
+targets). Kernel compiles are cached per (head config, mask treedef), so the
+parametrized sweeps mostly reuse a handful of compiles.
 """
 
 from __future__ import annotations
@@ -18,14 +17,12 @@ from conftest import assert_close, random_qkv
 
 import fa4_jax
 from fa4_jax import (
-    MaskMod,
+    FnMask,
     causal_mask,
     document_mask,
     flash_attn,
     sliding_window_mask,
 )
-
-pytestmark = pytest.mark.gpu
 
 DTYPES = [jnp.bfloat16, jnp.float16]
 
@@ -86,11 +83,11 @@ def test_fwd_lse(shape):
     assert_close(lse_got, lse_want, atol=1e-3, rtol=1e-3)
 
 
-# one MaskMod instance per test session: each is its own compile-cache key
+# Masks key the compile cache by class + static fields, so these could be
+# built per call; FnMask is the exception (its lambda hashes by identity).
 _WINDOW_MM = sliding_window_mask(24, 8)
 _CAUSAL_MM = causal_mask()
-_DOC_MM = document_mask()
-_HEAD_MM = MaskMod(lambda b, h, q, kv, aux: (kv <= q) | (h == 0), name="h0-full")
+_HEAD_MM = FnMask(lambda b, h, q, kv: (kv <= q) | (h == 0), label="h0-full")
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -122,20 +119,21 @@ def test_mask_mod_document_aux(dtype):
     ids = np.repeat(np.arange(len(lens)), lens)[:s]
     ids = np.pad(ids, (0, s - len(ids)), constant_values=len(lens))
     docs = jnp.asarray(np.stack([ids, ids[::-1].copy()]), dtype=jnp.int32)
-    got, want = _both(q, k, v, mask_mod=_DOC_MM, aux_tensors=(docs,))
+    got, want = _both(q, k, v, mask_mod=document_mask(docs))
     assert_close(got, want, dtype=dtype)
 
 
 def test_mask_mod_aux_change_reuses_kernel():
+    """Fresh mask instances with new array contents hit the compiled kernel."""
     import cutejax
 
     s = 128
     q, k, v = _mk((1, s, s, 1, 1, 64, None), jnp.bfloat16)
     ids1 = jnp.asarray(np.repeat([0, 1], [64, 64]))[None].astype(jnp.int32)
     ids2 = jnp.asarray(np.repeat([0, 1], [32, 96]))[None].astype(jnp.int32)
-    o1 = flash_attn(q, k, v, mask_mod=_DOC_MM, aux_tensors=(ids1,), backend="cute")
+    o1 = flash_attn(q, k, v, mask_mod=document_mask(ids1), backend="cute")
     before = cutejax.cache_info()["size"]
-    o2 = flash_attn(q, k, v, mask_mod=_DOC_MM, aux_tensors=(ids2,), backend="cute")
+    o2 = flash_attn(q, k, v, mask_mod=document_mask(ids2), backend="cute")
     assert cutejax.cache_info()["size"] == before, "aux data must not recompile"
     assert np.abs(np.asarray(o1 - o2, dtype=np.float32)).max() > 1e-3
 
@@ -203,9 +201,7 @@ def test_grad_mask_mod_aux():
     ids = jnp.asarray(np.repeat(np.arange(4), s // 4))[None].repeat(2, 0).astype(jnp.int32)
 
     def loss(backend):
-        return lambda q, k, v: flash_attn(
-            q, k, v, mask_mod=_DOC_MM, aux_tensors=(ids,), backend=backend
-        ).sum()
+        return lambda q, k, v: flash_attn(q, k, v, mask_mod=document_mask(ids), backend=backend).sum()
 
     got = jax.grad(loss("cute"), argnums=(0, 1, 2))(q, k, v)
     want = jax.grad(loss("reference"), argnums=(0, 1, 2))(q, k, v)
@@ -221,7 +217,7 @@ def test_native_mask_combines_with_mask_mod(native):
     s = 160
     q, k, v = _mk((2, s, s, 2, 1, 64, None), jnp.bfloat16)
     ids = jnp.asarray(np.repeat(np.arange(4), s // 4))[None].repeat(2, 0).astype(jnp.int32)
-    kw = dict(mask_mod=_DOC_MM, aux_tensors=(ids,), **native)
+    kw = dict(mask_mod=document_mask(ids), **native)
 
     got, want = _both(q, k, v, **kw)
     assert_close(got, want, dtype=q.dtype, msg="fwd")
@@ -287,9 +283,7 @@ def test_jvp_mask_mod_and_aux():
     ids = jnp.asarray(np.repeat(np.arange(4), s // 4))[None].repeat(2, 0).astype(jnp.int32)
 
     def f(backend):
-        return lambda q, k, v: flash_attn(
-            q, k, v, mask_mod=_DOC_MM, aux_tensors=(ids,), backend=backend
-        )
+        return lambda q, k, v: flash_attn(q, k, v, mask_mod=document_mask(ids), backend=backend)
 
     _, t_got = jax.jvp(f("cute"), (q, k, v), (dq, dk, dv))
     _, t_want = jax.jvp(f("reference"), (q, k, v), (dq, dk, dv))
