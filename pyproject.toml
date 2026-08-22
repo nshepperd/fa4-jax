@@ -1,0 +1,58 @@
+[project]
+name = "fa4-jax"
+version = "0.1.0"
+description = "FlashAttention-4 (CuTeDSL) for JAX: fwd/bwd/jvp with flex-attention mask mods, via cutejax"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "jax>=0.8.0",
+    "jaxtyping",
+    # JAX <-> CuTe DSL bridge (pytree args as codegen, per-dim static specs).
+    "cutejax",
+    # The vendored flash_attn.cute kernels import quack's copy/layout helpers.
+    "quack-kernels",
+    "nvidia-cutlass-dsl>=4.7",
+]
+
+[project.optional-dependencies]
+# GPU runtime: jax with CUDA plus the CuTe DSL CUDA runtime libraries. CPU-only
+# installs (reference backend, unit tests) don't need either.
+cu13 = ["jax[cuda13]", "nvidia-cutlass-dsl[cu13]>=4.7.0"]
+
+[tool.uv.sources]
+cutejax = { path = "../cutejax", editable = true }
+
+[tool.uv]
+# flash-attn-4's cutlass pin doesn't apply here (we vendor the kernels), but
+# quack-kernels may pin an older cutlass-dsl; the kernels run fine on 4.7+.
+override-dependencies = ["nvidia-cutlass-dsl>=4.7"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "hypothesis>=6.100",
+]
+
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatchling"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fa4_jax"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "gpu: needs a CUDA device (sm_80+ for the FA4 kernels); deselect with -m 'not gpu'",
+]
+
+[tool.ruff.lint]
+# jaxtyping shape-string annotations trip F722/F821/UP037. C408: dict(...) is
+# deliberate kwargs-style in hypothesis strategies and tolerance tables.
+ignore = ["F722", "F821", "UP037", "C408"]
+# The vendored kernels keep upstream style.
+exclude = ["src/fa4_jax/cute/*"]
+
+[tool.ty.environment]
+root = ["./src/"]
