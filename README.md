@@ -36,8 +36,11 @@ Restrictions (kernel-side, all checked with clear errors): fp16/bf16, head_dim
 a multiple of 8, GQA forward-and-JVP-only (repeat kv heads for reverse-mode
 gradients). Mask mods work in all three passes — the backward's mask_mod
 support is a local addition to the vendored kernel. Combining
-causal/window_size with a mask_mod folds the native mask into the predicate
-(correct, but forfeits the native paths' block skipping).
+causal/window_size with a mask_mod keeps the native band's KV-block skipping
+and runs the mod as a second masking pass over the visited tiles (also a
+local mask.py change; upstream's branch structure silently drops the mod in
+that combination). The mod itself can't skip blocks — that would need flex
+block sparsity, which is not wired up.
 
 ## Layout
 

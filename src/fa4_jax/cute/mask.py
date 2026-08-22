@@ -224,63 +224,11 @@ class AttentionMask:
         elif const_expr(
             not mask_causal and not mask_local and mask_mod is not None
         ):  # FlexAttention mask mod
-            nrow = const_expr(cute.size(tScS_mn.shape[0]))
-            ncol = const_expr(cute.size(tScS_mn.shape[1]))
-            has_fastdiv = const_expr(
-                fastdiv_mods is not None
-                and fastdiv_mods[0] is not None
-                and fastdiv_mods[1] is not None
+            self.apply_mask_mod_sm80(
+                acc_S_mn, tScS_mn, t0ScS_mn, ROW, COL, thr_col_offset,
+                batch_idx, head_idx, m_block, n_block,
+                mask_seqlen, mask_mod, aux_data, fastdiv_mods,
             )
-            wrap_aux_indices = const_expr(
-                has_fastdiv and mask_seqlen and const_expr(aux_data.tensors is not None)
-            )
-
-            for r in cutlass.range_constexpr(nrow):
-                # Respect swap_AB: ROW/COL determine which coordinate component corresponds to Q/KV.
-                local_row = tScS_mn[r, 0][ROW]
-                global_row_idx = local_row + m_block * self.tile_m
-                row_for_mod = global_row_idx
-                head_idx_for_mod = head_idx
-                if const_expr(self.qhead_per_kvhead_packgqa != 1):
-                    head_offset = global_row_idx % self.qhead_per_kvhead_packgqa
-                    head_idx_for_mod = head_idx * self.qhead_per_kvhead_packgqa + head_offset
-                    row_for_mod = global_row_idx // self.qhead_per_kvhead_packgqa
-                row_for_seqlen = row_for_mod
-                if const_expr(wrap_aux_indices):
-                    _, row_for_mod = divmod(row_for_mod, fastdiv_mods[0])
-
-                for col in cutlass.range_constexpr(ncol):
-                    col_idx_local = t0ScS_mn[0, col][COL]
-                    # Convert to absolute column index
-                    global_col_idx = thr_col_offset + col_idx_local + n_block * self.tile_n
-                    col_for_mod = global_col_idx
-                    if const_expr(wrap_aux_indices):
-                        _, col_for_mod = divmod(global_col_idx, fastdiv_mods[1])
-
-                    batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32)
-                    head_idx_ssa = utils.scalar_to_ssa(head_idx_for_mod, cutlass.Int32)
-                    q_idx_ssa = utils.scalar_to_ssa(row_for_mod, cutlass.Int32)
-                    kv_idx_ssa = utils.scalar_to_ssa(col_for_mod, cutlass.Int32)
-                    mask_value = call_mask_mod(
-                        mask_mod,
-                        batch_idx_ssa,
-                        head_idx_ssa,
-                        q_idx_ssa,
-                        kv_idx_ssa,
-                        self.seqlen_info,
-                        aux_data,
-                    )
-                    cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
-                    if const_expr(mask_seqlen):
-                        out_of_bounds = (row_for_seqlen >= self.seqlen_q) or (
-                            global_col_idx >= self.seqlen_k
-                        )
-                        if out_of_bounds:
-                            acc_S_mn[r, col] = -cutlass.Float32.inf
-                        else:
-                            acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
-                    else:
-                        acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
 
         else:  # Causal or local
             if const_expr(not self.swap_AB):
@@ -422,6 +370,102 @@ class AttentionMask:
                                 if row_idx < row_limit_top or row_idx > row_limit_bot
                                 else acc_S_mn[r, c]
                             )
+
+        # fa4-jax addition: a mask_mod combined with the native causal/local
+        # band. The band branch above has already applied its column limits
+        # (and the seqlen limit); the mod pass then masks further. Kept out of
+        # the branches above so the causal/local block-range skipping is
+        # unaffected -- the AND of the band with a mod can only mask more, so
+        # skipping blocks the band fully masks stays sound.
+        if const_expr(mask_mod is not None and (mask_causal or mask_local)):
+            self.apply_mask_mod_sm80(
+                acc_S_mn, tScS_mn, t0ScS_mn, ROW, COL, thr_col_offset,
+                batch_idx, head_idx, m_block, n_block,
+                # The band branches only clamp columns to seqlen_k when
+                # masking; rows past seqlen_q are never stored. What matters
+                # here is aux-index wrapping for out-of-range coordinates,
+                # which mask_seqlen turns on.
+                mask_seqlen, mask_mod, aux_data, fastdiv_mods,
+            )
+
+    @cute.jit
+    def apply_mask_mod_sm80(
+        self,
+        acc_S_mn: cute.Tensor,
+        tScS_mn: cute.Tensor,
+        t0ScS_mn: cute.Tensor,
+        ROW: cutlass.Constexpr[int],
+        COL: cutlass.Constexpr[int],
+        thr_col_offset: cutlass.Int32,
+        batch_idx: cutlass.Int32,
+        head_idx: cutlass.Int32,
+        m_block: cutlass.Int32,
+        n_block: cutlass.Int32,
+        mask_seqlen: cutlass.Constexpr[bool],
+        mask_mod: cutlass.Constexpr[Callable],
+        aux_data: AuxData,
+        fastdiv_mods=(None, None),
+    ) -> None:
+        """The FlexAttention mask_mod element loop (extracted so the
+        causal/local branch can run it as a second pass; fa4-jax refactor of
+        upstream's inline block)."""
+        nrow = const_expr(cute.size(tScS_mn.shape[0]))
+        ncol = const_expr(cute.size(tScS_mn.shape[1]))
+        has_fastdiv = const_expr(
+            fastdiv_mods is not None
+            and fastdiv_mods[0] is not None
+            and fastdiv_mods[1] is not None
+        )
+        wrap_aux_indices = const_expr(
+            has_fastdiv and mask_seqlen and const_expr(aux_data.tensors is not None)
+        )
+
+        for r in cutlass.range_constexpr(nrow):
+            # Respect swap_AB: ROW/COL determine which coordinate component corresponds to Q/KV.
+            local_row = tScS_mn[r, 0][ROW]
+            global_row_idx = local_row + m_block * self.tile_m
+            row_for_mod = global_row_idx
+            head_idx_for_mod = head_idx
+            if const_expr(self.qhead_per_kvhead_packgqa != 1):
+                head_offset = global_row_idx % self.qhead_per_kvhead_packgqa
+                head_idx_for_mod = head_idx * self.qhead_per_kvhead_packgqa + head_offset
+                row_for_mod = global_row_idx // self.qhead_per_kvhead_packgqa
+            row_for_seqlen = row_for_mod
+            if const_expr(wrap_aux_indices):
+                _, row_for_mod = divmod(row_for_mod, fastdiv_mods[0])
+
+            for col in cutlass.range_constexpr(ncol):
+                col_idx_local = t0ScS_mn[0, col][COL]
+                # Convert to absolute column index
+                global_col_idx = thr_col_offset + col_idx_local + n_block * self.tile_n
+                col_for_mod = global_col_idx
+                if const_expr(wrap_aux_indices):
+                    _, col_for_mod = divmod(global_col_idx, fastdiv_mods[1])
+
+                batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32)
+                head_idx_ssa = utils.scalar_to_ssa(head_idx_for_mod, cutlass.Int32)
+                q_idx_ssa = utils.scalar_to_ssa(row_for_mod, cutlass.Int32)
+                kv_idx_ssa = utils.scalar_to_ssa(col_for_mod, cutlass.Int32)
+                mask_value = call_mask_mod(
+                    mask_mod,
+                    batch_idx_ssa,
+                    head_idx_ssa,
+                    q_idx_ssa,
+                    kv_idx_ssa,
+                    self.seqlen_info,
+                    aux_data,
+                )
+                cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
+                if const_expr(mask_seqlen):
+                    out_of_bounds = (row_for_seqlen >= self.seqlen_q) or (
+                        global_col_idx >= self.seqlen_k
+                    )
+                    if out_of_bounds:
+                        acc_S_mn[r, col] = -cutlass.Float32.inf
+                    else:
+                        acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
+                else:
+                    acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
 
     @cute.jit
     def apply_mask_mod_sm100_scalar(

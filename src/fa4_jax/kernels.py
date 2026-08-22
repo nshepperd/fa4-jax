@@ -74,36 +74,6 @@ def _cute_mask_mod(mask: MaskMod):
     return mod
 
 
-@functools.cache
-def _folded_mask_mod(mask_mod: MaskMod, causal: bool, wl, wr) -> MaskMod:
-    """AND native causal/window semantics into a mask predicate.
-
-    The SM80/SM120 kernels' AttentionMask applies either the causal/local
-    band *or* a mask_mod, never both, so when a mask_mod is present the
-    native options must ride inside the predicate. Cached so the folded
-    MaskMod is identity-stable (it is a compile-cache key).
-    """
-    from fa4_jax.masks import and_masks, causal_mask, sliding_window_mask
-
-    parts = []
-    if causal:
-        parts.append(causal_mask())
-    elif wl is not None or wr is not None:
-        parts.append(sliding_window_mask(wl, wr))
-    return and_masks(*parts, mask_mod) if parts else mask_mod
-
-
-def _kernel_mask_view(cfg: AttnConfig):
-    """(causal, local, wl, wr, mask_mod) as the kernels should see them."""
-    causal, local, (wl, wr) = cfg.causal, cfg.local, cfg.window
-    mod = cfg.mask_mod
-    if mod is not None and (causal or local):
-        mod = _folded_mask_mod(mod, causal, wl, wr)
-        causal = local = False
-        wl = wr = None
-    return causal, local, wl, wr, mod
-
-
 # ---------------------------------------------------------------- forward
 
 
@@ -370,12 +340,13 @@ def _get_static(cfg: AttnConfig, dtype, head_dim, head_dim_v, qhead_per_kvhead, 
     """The static part of the call tree for (variant, kind); kind picks which
     kernel objects exist so unused ones are never built or compiled.
 
-    With a mask_mod present, native causal/window options are folded into the
-    predicate (see _kernel_mask_view) -- the kernels' AttentionMask cannot
-    apply both, and would otherwise silently drop the mod. The cost is the
-    causal/local block skipping, which mask mods don't get anyway.
+    Native causal/window options combine with a mask_mod directly: the
+    kernels keep the band's block-range skipping and AttentionMask runs the
+    mod as a second masking pass over the visited tiles (a local change to
+    the vendored mask.py -- upstream's branch structure would silently drop
+    the mod in that combination).
     """
-    causal, local, wl, wr, mask_mod = _kernel_mask_view(cfg)
+    causal, local, (wl, wr), mask_mod = cfg.causal, cfg.local, cfg.window, cfg.mask_mod
     st = _StaticDict(scale=cfg.scale, wl=wl, wr=wr, n_aux=cfg.n_aux)
     if kind == "fwd":
         st["fa"] = _get_fwd(

@@ -91,14 +91,6 @@ class FlashAttentionJvpSm80(FlashAttentionForwardSm80):
             mask_mod=mask_mod,
             has_aux_tensors=has_aux_tensors,
         )
-        # AttentionMask applies either the causal/local band or a mask_mod,
-        # never both; a combo here would silently drop the mod. Callers fold
-        # native masks into the predicate instead (fa4_jax.kernels does).
-        if mask_mod is not None:
-            assert not (is_causal or is_local), (
-                "mask_mod with is_causal/is_local would silently drop the mod; "
-                "fold causal/local into the mask predicate instead"
-            )
 
     @staticmethod
     def can_implement(dtype, head_dim, head_dim_v, tile_m, tile_n, num_threads) -> bool:

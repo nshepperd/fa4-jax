@@ -104,17 +104,12 @@ class FlashAttentionBackwardSm80:
         self.score_mod = score_mod
         self.score_mod_bwd = score_mod_bwd
         # fa4-jax: flex-attention mask_mod, applied to the recomputed S before
-        # the exp (masked -> -inf -> P = 0 -> dS = 0). Combining with
-        # is_causal/is_local is not supported here -- the causal/local branch
-        # of AttentionMask.apply_mask ignores mask_mod -- so callers must fold
-        # native masks into the predicate (fa4_jax.kernels does).
+        # the exp (masked -> -inf -> P = 0 -> dS = 0). Combines with
+        # is_causal/is_local: the band's block-range skipping stays, and
+        # AttentionMask runs the mod as a second pass over visited tiles.
         self.mask_mod = mask_mod
         self.has_aux_tensors = has_aux_tensors
         if mask_mod is not None:
-            assert not (is_causal or is_local), (
-                "mask_mod with is_causal/is_local would silently drop the mod; "
-                "fold causal/local into the mask predicate instead"
-            )
             assert not SdP_swapAB, "mask_mod assumes the (m, n) accumulator orientation"
             assert getattr(mask_mod, "__vec_size__", 1) == 1, (
                 "mask_mod vec_size > 1 not supported on Sm80/120"
