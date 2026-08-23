@@ -313,3 +313,91 @@ def test_empty_rows_convention():
     assert np.isfinite(np.asarray(lse[:, :, 3:])).all()
     g = jax.grad(lambda q: reference_attn(q, k, v, window_size=(None, -3)).sum())(q)
     assert np.isfinite(np.asarray(g)).all()
+
+
+# ---------------------------------------------------------------- vmap
+#
+# Without a mask the batching rule folds the vmapped axis into batch and
+# rebinds the primitives (so it runs on the kernels and keeps the custom
+# differentiation rules). With a mask it vmaps the backend impl instead, which
+# works on the reference backend only — see docs/mask-axes-vmap.md.
+
+
+def _vmapped(n=3, b=2, s=64, h=2, d=64, seed=21):
+    rng = np.random.default_rng(seed)
+    mk = lambda: jnp.asarray(rng.standard_normal((n, b, s, h, d)), jnp.bfloat16)
+    return mk(), mk(), mk()
+
+
+def _loop(f, *args, axes):
+    n = next(a.shape[0] for a, ax in zip(args, axes) if ax is not None)
+    pick = lambda a, ax, i: a if ax is None else a[i]
+    return jnp.stack(
+        [f(*(pick(a, ax, i) for a, ax in zip(args, axes))) for i in range(n)]
+    )
+
+
+@pytest.mark.parametrize("axes", [(0, 0, 0), (0, None, None), (None, 0, 0)])
+@pytest.mark.parametrize("kw", [dict(), dict(causal=True), dict(window_size=(16, 8))])
+def test_vmap_fold_fwd(axes, kw):
+    q, k, v = _vmapped()
+    args = tuple(a if ax is not None else a[0] for a, ax in zip((q, k, v), axes))
+    f = lambda q, k, v: flash_attn(q, k, v, backend="cute", **kw)
+    got = jax.vmap(f, in_axes=axes)(*args)
+    want = _loop(f, *args, axes=axes)
+    assert_close(got, want, atol=0, rtol=0)  # same kernel, same numbers
+
+
+def test_vmap_fold_lse():
+    q, k, v = _vmapped()
+    f = lambda q, k, v: flash_attn(q, k, v, return_lse=True, backend="cute")[1]
+    got = jax.vmap(f)(q, k, v)
+    want = _loop(f, q, k, v, axes=(0, 0, 0))
+    assert_close(got, want, atol=0, rtol=0)
+
+
+def test_vmap_fold_grad_and_jvp():
+    """vmap of grad / jvp goes through the folded primitives on the kernels."""
+    q, k, v = _vmapped()
+    dq, dk, dv = _vmapped(seed=22)
+    loss = lambda q, k, v: flash_attn(q, k, v, causal=True, backend="cute").sum()
+    g = jax.grad(loss, argnums=(0, 1, 2))
+    got = jax.vmap(g)(q, k, v)
+    want = [_loop(lambda *a, i=i: g(*a)[i], q, k, v, axes=(0, 0, 0)) for i in range(3)]
+    for a, b in zip(got, want):
+        assert_close(a, b, atol=0, rtol=0)
+
+    f = lambda q, k, v: flash_attn(q, k, v, causal=True, backend="cute")
+    tan = lambda q, k, v, dq, dk, dv: jax.jvp(f, (q, k, v), (dq, dk, dv))[1]
+    got = jax.vmap(tan)(q, k, v, dq, dk, dv)
+    want = _loop(tan, q, k, v, dq, dk, dv, axes=(0,) * 6)
+    assert_close(got, want, atol=0, rtol=0)
+
+
+def test_vmap_mask_reference_fallback():
+    """A mask with batched array leaves: vmaps the reference impl."""
+    q, k, v = _vmapped()
+    ids = jnp.asarray(np.random.default_rng(23).integers(0, 3, q.shape[:3]), jnp.int32)
+    f = lambda q, k, v, ids: flash_attn(
+        q, k, v, mask_mod=document_mask(ids), backend="reference"
+    )
+    got = jax.vmap(f)(q, k, v, ids)
+    want = _loop(f, q, k, v, ids, axes=(0, 0, 0, 0))
+    assert_close(got, want, dtype=q.dtype)
+    # leafless mask, also the fallback path today (it has no axis declaration)
+    f = lambda q, k, v: flash_attn(
+        q, k, v, mask_mod=sliding_window_mask(8, 4), backend="reference"
+    )
+    assert_close(jax.vmap(f)(q, k, v), _loop(f, q, k, v, axes=(0, 0, 0)), dtype=q.dtype)
+
+
+def test_vmap_mask_cute_unsupported():
+    """Known gap (starchart iwx1ok): the fallback vmaps cutejax's ffi_call,
+    which has no batching rule."""
+    q, k, v = _vmapped()
+    ids = jnp.asarray(np.random.default_rng(23).integers(0, 3, q.shape[:3]), jnp.int32)
+    f = lambda q, k, v, ids: flash_attn(
+        q, k, v, mask_mod=document_mask(ids), backend="cute"
+    )
+    with pytest.raises(NotImplementedError, match="vmap"):
+        jax.vmap(f)(q, k, v, ids)

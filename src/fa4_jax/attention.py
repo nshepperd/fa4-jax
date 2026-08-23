@@ -1,13 +1,15 @@
 """Public ``flash_attn`` and its differentiation wiring.
 
-The function is built on two JAX primitives rather than ``jax.custom_vjp``,
+The function is built on three JAX primitives rather than ``jax.custom_vjp``,
 because it supports *both* differentiation modes and custom_vjp forbids
 forward mode:
 
 - ``fa4_fwd``: ``(q, k, v, *aux) -> (out[, lse])``. Its JVP rule computes the
   primal via the kernel forward (with LSE) and the tangent via ``fa4_tangent``.
 - ``fa4_tangent``: ``(q, k, v, out, lse, dq, dk, dv, *aux) -> (t_out, t_lse)``.
-  Linear in ``(dq, dk, dv)``; its *transpose* rule is the FA4 backward pass.
+  Linear in ``(dq, dk, dv)``; its *transpose* rule binds
+- ``fa4_vjp``: ``(q, k, v, out, lse, d_out[, d_lse], *aux) -> (dq, dk, dv)``,
+  the FA4 backward pass (a primitive of its own so it batches under vmap).
 
 Reverse mode therefore costs exactly what a custom_vjp would (linearization
 runs the forward-with-LSE; transposition runs the backward kernels; the
@@ -20,7 +22,8 @@ Backends implement the four array-level operations (see ``Backend``); the
 "reference" backend is plain jnp and runs anywhere, the "cute" backend calls
 the vendored FA4 kernels through cutejax and needs a CUDA device. All shape
 canonicalization, validation, and differentiation logic above the backend is
-shared — so the wiring itself is fully exercised by the CPU test suite.
+shared — so the wiring is checked once, against plain JAX autodiff of the
+reference, and the kernels are checked against the reference.
 """
 
 from __future__ import annotations
@@ -135,7 +138,9 @@ def _fwd_jvp(primals, tangents, *, cfg: AttnConfig, need_lse: bool):
     q, k, v, *aux = primals
     dq, dk, dv, *daux = tangents
     if any(not isinstance(t, ad.Zero) for t in daux):
-        raise NotImplementedError("fa4 mask_mod array fields (aux data) are not differentiable")
+        raise NotImplementedError(
+            "fa4 mask_mod array fields (aux data) are not differentiable"
+        )
     out, lse = fa4_fwd_p.bind(q, k, v, *aux, cfg=cfg, need_lse=True)
     dq, dk, dv = (
         ad.instantiate_zeros(t) if isinstance(t, ad.Zero) else t for t in (dq, dk, dv)
@@ -146,7 +151,9 @@ def _fwd_jvp(primals, tangents, *, cfg: AttnConfig, need_lse: bool):
     return (out,), (t_out,)
 
 
-fa4_fwd_p.def_impl(functools.partial(jax.jit, static_argnames=("cfg", "need_lse"))(_fwd_impl))
+fa4_fwd_p.def_impl(
+    functools.partial(jax.jit, static_argnames=("cfg", "need_lse"))(_fwd_impl)
+)
 fa4_fwd_p.def_abstract_eval(_fwd_abstract)
 ad.primitive_jvps[fa4_fwd_p] = _fwd_jvp
 mlir.register_lowering(fa4_fwd_p, mlir.lower_fun(_fwd_impl, multiple_results=True))
@@ -168,22 +175,64 @@ def _tangent_transpose(cts, q, k, v, out, lse, dq, dk, dv, *aux, cfg: AttnConfig
     assert not any(ad.is_undefined_primal(x) for x in (q, k, v, out, lse, *aux)), (
         "fa4_tangent transpose: residuals must be known primals"
     )
-    ct_out = jnp.zeros(out.aval.shape, out.aval.dtype) if isinstance(ct_out, ad.Zero) else ct_out
-    d_lse = None if isinstance(ct_lse, ad.Zero) else ct_lse
-    be = get_backend(cfg.backend)
-    dq_bar, dk_bar, dv_bar = be.vjp(cfg, q, k, v, out, lse, ct_out, d_lse, aux)
+    ct_out = (
+        jnp.zeros(out.aval.shape, out.aval.dtype)
+        if isinstance(ct_out, ad.Zero)
+        else ct_out
+    )
+    d_lse = () if isinstance(ct_lse, ad.Zero) else (ct_lse,)
+    dq_bar, dk_bar, dv_bar = fa4_vjp_p.bind(
+        q, k, v, out, lse, ct_out, *d_lse, *aux, cfg=cfg, has_d_lse=bool(d_lse)
+    )
     return (None, None, None, None, None, dq_bar, dk_bar, dv_bar, *[None] * len(aux))
 
 
-fa4_tangent_p.def_impl(functools.partial(jax.jit, static_argnames=("cfg",))(_tangent_impl))
+fa4_tangent_p.def_impl(
+    functools.partial(jax.jit, static_argnames=("cfg",))(_tangent_impl)
+)
 fa4_tangent_p.def_abstract_eval(_tangent_abstract)
 ad.primitive_transposes[fa4_tangent_p] = _tangent_transpose
-mlir.register_lowering(fa4_tangent_p, mlir.lower_fun(_tangent_impl, multiple_results=True))
+mlir.register_lowering(
+    fa4_tangent_p, mlir.lower_fun(_tangent_impl, multiple_results=True)
+)
+
+
+# The backward is its own primitive (rather than a direct backend call inside
+# the transpose rule) so that it, too, has a batching rule: the transpose
+# runs under any enclosing vmap (per-example gradients), and a raw cutejax
+# call there would have no way to batch.
+
+fa4_vjp_p = Primitive("fa4_vjp")
+fa4_vjp_p.multiple_results = True
+
+
+def _vjp_split(args, has_d_lse):
+    q, k, v, out, lse, d_out, *rest = args
+    d_lse, aux = (rest[0], rest[1:]) if has_d_lse else (None, rest)
+    return q, k, v, out, lse, d_out, d_lse, tuple(aux)
+
+
+def _vjp_impl(*args, cfg: AttnConfig, has_d_lse: bool):
+    q, k, v, out, lse, d_out, d_lse, aux = _vjp_split(args, has_d_lse)
+    be = get_backend(cfg.backend)
+    return tuple(be.vjp(cfg, q, k, v, out, lse, d_out, d_lse, aux))
+
+
+def _vjp_abstract(*args, cfg: AttnConfig, has_d_lse: bool):
+    q, k, v, *_ = args
+    return tuple(jax.core.ShapedArray(x.shape, x.dtype) for x in (q, k, v))
+
+
+fa4_vjp_p.def_impl(
+    functools.partial(jax.jit, static_argnames=("cfg", "has_d_lse"))(_vjp_impl)
+)
+fa4_vjp_p.def_abstract_eval(_vjp_abstract)
+mlir.register_lowering(fa4_vjp_p, mlir.lower_fun(_vjp_impl, multiple_results=True))
 
 
 # ---------------------------------------------------------------- batching
 #
-# Every operand and result of both primitives carries batch as its leading
+# Every operand and result of the three primitives carries batch as its leading
 # axis, so vmap folds into it: move the mapped axis to the front, broadcast
 # unmapped operands across it, reshape (vmap, batch, ...) -> (vmap*batch, ...)
 # and rebind the same primitive. That keeps the custom jvp/transpose rules in
@@ -227,8 +276,15 @@ def _tangent_batch(args, dims, *, cfg: AttnConfig):
     return _batch_via_impl(_tangent_impl, args, dims, cfg=cfg)
 
 
+def _vjp_batch(args, dims, *, cfg: AttnConfig, has_d_lse: bool):
+    if cfg.mask is None:
+        return _batch_via_fold(fa4_vjp_p, args, dims, cfg=cfg, has_d_lse=has_d_lse)
+    return _batch_via_impl(_vjp_impl, args, dims, cfg=cfg, has_d_lse=has_d_lse)
+
+
 batching.primitive_batchers[fa4_fwd_p] = _fwd_batch
 batching.primitive_batchers[fa4_tangent_p] = _tangent_batch
+batching.primitive_batchers[fa4_vjp_p] = _vjp_batch
 
 
 # ---------------------------------------------------------------- public API
@@ -299,7 +355,9 @@ def flash_attn(
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
         raise ValueError("flash_attn takes (batch, seqlen, heads, head_dim) arrays")
     if q.dtype != k.dtype or q.dtype != v.dtype:
-        raise ValueError(f"q/k/v dtypes must match, got {q.dtype}, {k.dtype}, {v.dtype}")
+        raise ValueError(
+            f"q/k/v dtypes must match, got {q.dtype}, {k.dtype}, {v.dtype}"
+        )
     if k.shape[1] != v.shape[1] or k.shape[2] != v.shape[2]:
         raise ValueError(f"k/v seqlen+heads must match, got {k.shape} vs {v.shape}")
     if q.shape[0] != k.shape[0]:
@@ -307,7 +365,9 @@ def flash_attn(
     if q.shape[3] != k.shape[3]:
         raise ValueError(f"q/k head_dim mismatch: {q.shape[3]} vs {k.shape[3]}")
     if q.shape[2] % k.shape[2]:
-        raise ValueError(f"q heads {q.shape[2]} not a multiple of kv heads {k.shape[2]}")
+        raise ValueError(
+            f"q heads {q.shape[2]} not a multiple of kv heads {k.shape[2]}"
+        )
     if mask_mod is not None and not isinstance(mask_mod, MaskMod):
         raise TypeError(
             "mask_mod must be a fa4_jax.MaskMod (a raw callable can't run on "
@@ -326,7 +386,9 @@ def flash_attn(
 
     left, right = window_size if window_size is not None else (None, None)
     causal, local, wl, wr = _resolve_causal_local_window(
-        causal, None if left is None else int(left), None if right is None else int(right)
+        causal,
+        None if left is None else int(left),
+        None if right is None else int(right),
     )
     cfg = AttnConfig(
         causal=causal,
