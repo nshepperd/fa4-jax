@@ -10,10 +10,14 @@ implementation independent of anything in this repo; the only local work is
 mapping conventions onto it:
 
 - Layout ``(batch, seqlen, heads, head_dim)``; GQA by giving k/v fewer heads.
-- ``window_size=(left, right)`` counted from the query position, inclusive
-  band ``-right <= q - kv <= left``, ``None`` meaning unbounded; combines
-  with ``causal`` and with a ``mask_mod`` (which becomes a dense boolean
-  mask).
+- ``causal`` and ``window_size`` are **bottom-right aligned** when
+  ``s_q != s_kv`` (the flash-attention convention): query ``i`` sits at key
+  position ``i + (s_kv - s_q)``, so the last query always sees the last key.
+  ``window_size=(left, right)`` is the inclusive band
+  ``-right <= (q + s_kv - s_q) - kv <= left``, ``None`` meaning unbounded;
+  combines with ``causal`` and with a ``mask_mod`` (which becomes a dense
+  boolean mask). Mask mods get raw indices and know nothing about the
+  alignment, so ``causal_mask()`` stays top-left.
 - Rows with no visible key return **zeros** (and ``lse = -inf``), the
   flash-attention convention; jax.nn would return a uniform average with a
   huge negative lse instead, so those rows are patched afterwards.
@@ -45,17 +49,22 @@ def dense_mask(
     window: tuple[int | None, int | None],
     mask_mod: MaskMod | None,
 ) -> Bool[Array, "batch heads s_q s_kv"] | None:
-    """The combined visibility mask as a dense boolean, or None if all-visible."""
+    """The combined visibility mask as a dense boolean, or None if all-visible.
+
+    ``causal``/``window`` are bottom-right aligned (see the module docstring);
+    ``mask_mod`` sees the raw ``(q, kv)`` indices.
+    """
     q = jnp.arange(s_q)[:, None]
     kv = jnp.arange(s_kv)[None, :]
+    q_pos = q + (s_kv - s_q)  # the query's position on the key axis
     parts = []
     if causal:
-        parts.append(kv <= q)
+        parts.append(kv <= q_pos)
     left, right = window
     if left is not None:
-        parts.append(q - kv <= left)
+        parts.append(q_pos - kv <= left)
     if right is not None:
-        parts.append(kv - q <= right)
+        parts.append(kv - q_pos <= right)
     mask = None
     for p in parts:
         p = jnp.broadcast_to(p, (s_q, s_kv))[None, None]
@@ -74,40 +83,26 @@ def dense_mask(
 def fwd_lse(q, k, v, scale: float, causal: bool, window, mask_mod: MaskMod | None):
     """(out, lse) in float32 from float32 inputs; see the module docstring.
 
-    ``causal``/``window`` go to jax.nn natively (its band logic is an
-    independent check of ours); the mask_mod rides in as a dense mask. The
-    combined dense mask is still built, to find rows with no visible key.
+    Every masking option (causal, window, mask_mod) becomes one dense boolean
+    handed to jax.nn as ``mask`` — jax.nn's own ``is_causal`` /
+    ``local_window_size`` are top-left aligned, which is not the convention
+    here. The same dense mask finds rows with no visible key.
     """
     b, s_q, h, d = q.shape
     s_kv, d_v = k.shape[1], v.shape[3]
-    left, right = window
-    local = left is not None or right is not None
-    mod_mask = dense_mask(b, h, s_q, s_kv, False, (None, None), mask_mod)
+    full = dense_mask(b, h, s_q, s_kv, causal, window, mask_mod)
 
     # jax.nn wants one head dim for q/k/v: zero-pad to the larger (padding
     # q/k leaves the scores unchanged; padded v columns are sliced off).
     dd = max(d, d_v)
     pad = lambda x: jnp.pad(x, ((0, 0), (0, 0), (0, 0), (0, dd - x.shape[3])))
     out = jax.nn.dot_product_attention(
-        pad(q),
-        pad(k),
-        pad(v),
-        mask=mod_mask,
-        scale=scale,
-        is_causal=causal,
-        local_window_size=(
-            s_kv if left is None else left,
-            s_kv if right is None else right,
-        )
-        if local
-        else None,
-        implementation="xla",
+        pad(q), pad(k), pad(v), mask=full, scale=scale, implementation="xla"
     )[..., :d_v]
 
     # jax.nn's return_residual lse is stop_gradient'ed, so take the lse from
     # the scores directly (jax.nn.logsumexp; differentiable, -inf on empty
     # rows with a finite gradient).
-    full = dense_mask(b, h, s_q, s_kv, causal, window, mask_mod)
     s = jnp.einsum("bqhd,bkhd->bhqk", q, _expand_kv(k, h)) * scale
     if full is not None:
         s = jnp.where(full, s, -jnp.inf)

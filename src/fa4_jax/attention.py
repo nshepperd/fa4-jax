@@ -329,13 +329,21 @@ def flash_attn(
         q, k, v: ``(batch, seqlen, heads, head_dim)``; fp16/bf16 on the cute
             backend, any float on the reference backend. GQA by giving k/v
             fewer heads (must divide q's).
-        causal: mask out ``kv_idx > q_idx``; equivalent to
+        causal: mask out keys after the query's position; equivalent to
             ``window_size=(None, 0)`` and takes the kernel's causal path.
         window_size: ``(left, right)`` sliding window in keys, counted from
             the query position and inclusive of the band
-            ``-right <= q - kv <= left``; ``None`` on either side means
+            ``-right <= q_pos - kv <= left``; ``None`` on either side means
             unbounded. Combines with ``causal``. Out-of-band KV blocks are
             *skipped*, not masked.
+
+            Both are **bottom-right aligned** (the flash-attention
+            convention): ``q_pos = q_idx + (kv_seq - q_seq)``, so with
+            ``q_seq != kv_seq`` the last query lines up with the last key —
+            the decode / chunked-prefill case. ``mask_mod`` predicates see
+            raw ``q_idx``/``kv_idx`` and are unaffected, so
+            ``mask_mod=causal_mask()`` is top-left and differs from
+            ``causal=True`` unless ``q_seq == kv_seq``.
         scale: softmax scale, default ``1/sqrt(head_dim)``.
         mask_mod: a :class:`fa4_jax.MaskMod` flex-attention predicate — a
             callable pytree. Its class and static fields are baked into the

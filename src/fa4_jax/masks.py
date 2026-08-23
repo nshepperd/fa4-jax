@@ -153,6 +153,9 @@ class CausalMask(MaskMod):
     causal path, which also *skips* future KV blocks; this mask-mod variant
     computes and masks them. It exists for composing with other mask mods and
     for exercising the flex path in tests.
+
+    Mask mods see raw indices, so this is *top-left* aligned; ``causal=True``
+    is bottom-right aligned and differs when ``q_seq != kv_seq``.
     """
 
     def __call__(self, b, h, q_idx, kv_idx):
@@ -163,9 +166,11 @@ class CausalMask(MaskMod):
 class SlidingWindowMask(MaskMod):
     """Two-sided window: allow when ``-right <= q - kv <= left``; None = unbounded.
 
-    Same convention as ``flash_attn``'s native ``window_size`` (which, again,
-    skips out-of-band blocks and should be preferred when the window is all
-    you need).
+    Same band as ``flash_attn``'s native ``window_size`` (which, again, skips
+    out-of-band blocks and should be preferred when the window is all you
+    need), except that this one is measured from the raw ``q_idx`` (top-left)
+    while the native option is bottom-right aligned; they agree when
+    ``q_seq == kv_seq``.
     """
 
     left: int | None = static()

@@ -72,9 +72,22 @@ def test_rejects_raw_callable_mask():
         flash_attn(q, k, v, mask_mod=lambda b, h, qi, ki: ki <= qi)
 
 
+@pytest.mark.cuda
 def test_rejects_f32_on_cute():
     q, k, v = _qkv(jnp.float32)
     with pytest.raises(ValueError, match="fp16/bf16"):
+        flash_attn(q, k, v, backend="cute")
+
+
+@pytest.mark.cuda
+def test_rejects_unsupported_head_dim_on_cute():
+    """head_dim 256 does not fit the SM80/SM120 tile budget; must be a clean
+    error, not a failed launch that poisons the CUDA context."""
+    q, k, v = random_qkv(np.random.default_rng(0), 1, 64, 64, 1, 1, 256, dtype=jnp.bfloat16)
+    with pytest.raises(ValueError, match="cannot run head_dim=256"):
+        flash_attn(q, k, v, backend="cute")
+    q, k, v = random_qkv(np.random.default_rng(0), 1, 64, 64, 1, 1, 20, dtype=jnp.bfloat16)
+    with pytest.raises(ValueError, match="multiples of 8"):
         flash_attn(q, k, v, backend="cute")
 
 
@@ -82,6 +95,13 @@ def test_unknown_backend():
     q, k, v = _qkv()
     with pytest.raises(KeyError):
         flash_attn(q, k, v, backend="nope")
+
+
+def test_default_backend_follows_jax_device():
+    from fa4_jax.attention import _default_backend
+
+    want = "cute" if jax.default_backend() == "gpu" else "reference"
+    assert _default_backend() == want
 
 
 def test_window_canonicalization():
@@ -99,15 +119,15 @@ def test_window_canonicalization():
 
 def test_causal_flag_equals_right_zero_window():
     q, k, v = _qkv()
-    a = flash_attn(q, k, v, causal=True)
-    b = flash_attn(q, k, v, window_size=(None, 0))
+    a = flash_attn(q, k, v, causal=True, backend="reference")
+    b = flash_attn(q, k, v, window_size=(None, 0), backend="reference")
     assert_close(a, b, atol=0, rtol=0)
 
 
 def test_causal_and_window_combine():
     q, k, v = _qkv()
-    a = flash_attn(q, k, v, causal=True, window_size=(3, None))
-    b = flash_attn(q, k, v, window_size=(3, 0))
+    a = flash_attn(q, k, v, causal=True, window_size=(3, None), backend="reference")
+    b = flash_attn(q, k, v, window_size=(3, 0), backend="reference")
     assert_close(a, b, atol=0, rtol=0)
 
 
@@ -134,6 +154,27 @@ def test_dense_mask_semantics():
     d = _dense(head)
     assert d[:, 0].all()
     np.testing.assert_array_equal(d[:, 1:], np.broadcast_to(kv <= q, (2, 2, 7, 9)))
+
+
+def test_native_masks_are_bottom_right_aligned():
+    """causal/window_size line the last query up with the last key when
+    s_q != s_kv (flash-attention convention); mask mods see raw indices."""
+    q, kv = np.mgrid[0:4, 0:10]
+    off = 10 - 4
+    got = np.asarray(dense_mask(1, 1, 4, 10, True, (None, None), None))[0, 0]
+    np.testing.assert_array_equal(got, kv <= q + off)
+    assert got[-1].all() and got[0].sum() == off + 1  # row 0 sees keys 0..6
+    got = np.asarray(dense_mask(1, 1, 4, 10, False, (2, 1), None))[0, 0]
+    np.testing.assert_array_equal(got, (q + off - kv <= 2) & (kv - q - off <= 1))
+    # s_q > s_kv: early queries see nothing under causal
+    got = np.asarray(dense_mask(1, 1, 10, 4, True, (None, None), None))[0, 0]
+    q, kv = np.mgrid[0:10, 0:4]
+    np.testing.assert_array_equal(got, kv <= q - 6)
+    assert not got[:6].any()
+    # the mask-mod causal is top-left, so it differs from causal=True here
+    mm = np.asarray(dense_mask(1, 1, 4, 10, False, (None, None), causal_mask()))[0, 0]
+    q, kv = np.mgrid[0:4, 0:10]
+    np.testing.assert_array_equal(mm, kv <= q)
 
 
 def test_document_mask_dense():
@@ -170,6 +211,7 @@ def test_static_fields_key_the_treedef():
     )
 
 
+@pytest.mark.cuda
 def test_custom_mask_class():
     """User-defined MaskMod subclasses register as pytrees automatically and
     run on the kernels."""
@@ -196,6 +238,15 @@ def test_custom_mask_class():
     got = flash_attn(q, k, v, mask_mod=m, backend="cute")
     want = flash_attn(q, k, v, mask_mod=m, backend="reference")
     assert_close(got, want, dtype=q.dtype)
+
+
+def test_mask_constructor_validation():
+    with pytest.raises(ValueError, match="unbounded"):
+        sliding_window_mask(None, None)
+    with pytest.raises(ValueError, match="at least one"):
+        and_masks()
+    with pytest.raises(ValueError, match="at least one"):
+        or_masks()
 
 
 def test_non_array_leaf_rejected():
@@ -277,6 +328,36 @@ def test_wiring_lse_is_differentiable():
         assert_close(got, want, dtype=q.dtype)
 
 
+def test_wiring_partial_tangents():
+    """Differentiating w.r.t. a subset of (q, k, v): the JVP rule instantiates
+    the symbolic-zero tangents of the rest (ad.Zero -> zeros)."""
+    q, k, v, dq, dk, dv = _wiring_case(seed=11)
+    f = lambda q, k, v: flash_attn(q, k, v, causal=True, backend="reference")
+    g = lambda q, k, v: reference_attn(q, k, v, causal=True)
+    for argnum, tangent in ((0, dq), (1, dk), (2, dv)):
+        args = [q, k, v]
+        ff = lambda x, i=argnum: f(*[x if j == i else a for j, a in enumerate(args)])
+        gg = lambda x, i=argnum: g(*[x if j == i else a for j, a in enumerate(args)])
+        _, tf = jax.jvp(ff, (args[argnum],), (tangent,))
+        _, tg = jax.jvp(gg, (args[argnum],), (tangent,))
+        assert_close(tf, tg, dtype=q.dtype, msg=f"jvp argnum {argnum}")
+        gf = jax.grad(lambda x: ff(x).sum())(args[argnum])
+        gg_ = jax.grad(lambda x: gg(x).sum())(args[argnum])
+        assert_close(gf, gg_, dtype=q.dtype, msg=f"grad argnum {argnum}")
+
+
+def test_wiring_grad_with_unused_lse():
+    """return_lse=True but only `out` is differentiated: the lse cotangent is
+    a symbolic zero and the transpose must not pass a d_lse."""
+    q, k, v, *_ = _wiring_case(seed=12)
+    f = lambda q, k, v: flash_attn(q, k, v, return_lse=True, backend="reference")[0].sum()
+    g = lambda q, k, v: reference_attn(q, k, v).sum()
+    gf = jax.grad(f, argnums=(0, 1, 2))(q, k, v)
+    gg = jax.grad(g, argnums=(0, 1, 2))(q, k, v)
+    for got, want in zip(gf, gg):
+        assert_close(got, want, dtype=q.dtype)
+
+
 def test_wiring_gqa_grad():
     q, k, v, *_ = _wiring_case(seed=9, h_q=4, h_kv=2)
     gf = jax.grad(
@@ -337,6 +418,7 @@ def _loop(f, *args, axes):
     )
 
 
+@pytest.mark.cuda
 @pytest.mark.parametrize("axes", [(0, 0, 0), (0, None, None), (None, 0, 0)])
 @pytest.mark.parametrize("kw", [dict(), dict(causal=True), dict(window_size=(16, 8))])
 def test_vmap_fold_fwd(axes, kw):
@@ -348,6 +430,49 @@ def test_vmap_fold_fwd(axes, kw):
     assert_close(got, want, atol=0, rtol=0)  # same kernel, same numbers
 
 
+def test_vmap_fold_nonzero_axes_and_gqa():
+    """Mapped axis not in front (the moveaxis branch), out_axes != 0, nested
+    vmap, and GQA under the fold; reference backend so it runs anywhere."""
+    rng = np.random.default_rng(24)
+    n, b, s, d = 3, 2, 16, 8
+    q = jnp.asarray(rng.standard_normal((b, n, s, 4, d)), jnp.float32)  # mapped axis 1
+    k = jnp.asarray(rng.standard_normal((b, s, 2, n, d)), jnp.float32)  # mapped axis 3
+    v = jnp.asarray(rng.standard_normal((n, b, s, 2, d)), jnp.float32)  # mapped axis 0
+    f = lambda q, k, v: flash_attn(q, k, v, causal=True, backend="reference")
+    got = jax.vmap(f, in_axes=(1, 3, 0), out_axes=2)(q, k, v)
+    want = jnp.stack(
+        [f(q[:, i], k[:, :, :, i], v[i]) for i in range(n)], axis=2
+    )
+    assert_close(got, want, atol=1e-5, rtol=1e-5)
+    # nested vmap over a second fresh axis
+    q2 = jnp.stack([q, q * 0.5])
+    got = jax.vmap(jax.vmap(f, in_axes=(1, 3, 0)), in_axes=(0, None, None))(q2, k, v)
+    want = jnp.stack([jax.vmap(f, in_axes=(1, 3, 0))(qq, k, v) for qq in q2])
+    assert_close(got, want, atol=1e-5, rtol=1e-5)
+
+
+def test_vmap_grad_through_lse():
+    """vmap of a grad that flows through lse exercises fa4_vjp's batching rule
+    with has_d_lse=True."""
+    rng = np.random.default_rng(25)
+    mk = lambda: jnp.asarray(rng.standard_normal((3, 1, 16, 2, 8)), jnp.float32)
+    q, k, v = mk(), mk(), mk()
+
+    def loss(q, k, v):
+        out, lse = flash_attn(q, k, v, return_lse=True, backend="reference")
+        return out.sum() + (lse * 0.3).sum()
+
+    def loss_ref(q, k, v):
+        out, lse = reference_attn(q, k, v, return_lse=True)
+        return out.sum() + (lse * 0.3).sum()
+
+    got = jax.vmap(jax.grad(loss, argnums=(0, 1, 2)))(q, k, v)
+    want = jax.vmap(jax.grad(loss_ref, argnums=(0, 1, 2)))(q, k, v)
+    for a, b in zip(got, want):
+        assert_close(a, b, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.cuda
 def test_vmap_fold_lse():
     q, k, v = _vmapped()
     f = lambda q, k, v: flash_attn(q, k, v, return_lse=True, backend="cute")[1]
@@ -356,6 +481,7 @@ def test_vmap_fold_lse():
     assert_close(got, want, atol=0, rtol=0)
 
 
+@pytest.mark.cuda
 def test_vmap_fold_grad_and_jvp():
     """vmap of grad / jvp goes through the folded primitives on the kernels."""
     q, k, v = _vmapped()
@@ -391,9 +517,11 @@ def test_vmap_mask_reference_fallback():
     assert_close(jax.vmap(f)(q, k, v), _loop(f, q, k, v, axes=(0, 0, 0)), dtype=q.dtype)
 
 
+@pytest.mark.cuda
 def test_vmap_mask_cute_unsupported():
     """Known gap (starchart iwx1ok): the fallback vmaps cutejax's ffi_call,
-    which has no batching rule."""
+    which has no batching rule. Applies to leafless masks too (no axis
+    declaration yet, see docs/mask-axes-vmap.md)."""
     q, k, v = _vmapped()
     ids = jnp.asarray(np.random.default_rng(23).integers(0, 3, q.shape[:3]), jnp.int32)
     f = lambda q, k, v, ids: flash_attn(
@@ -401,3 +529,6 @@ def test_vmap_mask_cute_unsupported():
     )
     with pytest.raises(NotImplementedError, match="vmap"):
         jax.vmap(f)(q, k, v, ids)
+    g = lambda q, k, v: flash_attn(q, k, v, mask_mod=sliding_window_mask(8, 4), backend="cute")
+    with pytest.raises(NotImplementedError, match="vmap"):
+        jax.vmap(g)(q, k, v)

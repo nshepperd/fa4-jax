@@ -413,20 +413,51 @@ def _get_static(cfg: AttnConfig, dtype, head_dim, head_dim_v, qhead_per_kvhead, 
     return st
 
 
-def _validate(cfg: AttnConfig, q, k, v):
+@functools.cache
+def _can_implement(kind: str, dtype, head_dim: int, head_dim_v: int, causal: bool, arch: int) -> bool:
+    """Ask the kernel class whether our tile config fits (SMEM budget, head
+    dim limits); a launch that overflows SMEM would otherwise fail *inside*
+    CUDA and leave the context in an error state."""
+    if kind == "fwd":
+        tile_m, tile_n = _fwd_tile_mn(arch, head_dim)
+        return _fwd_kernel_cls(arch).can_implement(
+            dtype, head_dim, head_dim_v, tile_m, tile_n, 1, 128, causal
+        )
+    if kind == "bwd":
+        stages = 2 if head_dim <= 64 else 1
+        return _bwd_kernel_cls(arch).can_implement(
+            dtype, head_dim, head_dim_v, _BWD_TILE_M, _BWD_TILE_N, stages, stages,
+            _BWD_NUM_THREADS, causal,
+        )
+    if kind == "jvp":
+        from fa4_jax.cute.flash_jvp import FlashAttentionJvpSm80
+
+        tile_m = 128 if max(head_dim, head_dim_v) <= 64 else 64
+        return FlashAttentionJvpSm80.can_implement(dtype, head_dim, head_dim_v, tile_m, 64, 128)
+    raise ValueError(kind)
+
+
+def _validate(cfg: AttnConfig, kind: str, q, k, v):
     dtype = _DTYPES.get(jnp.dtype(q.dtype))
     if dtype is None:
         raise ValueError(f"FA4 kernels take fp16/bf16 only, got {q.dtype}")
     head_dim, head_dim_v = q.shape[3], v.shape[3]
     if head_dim % 8 or head_dim_v % 8:
         raise ValueError(f"head dims must be multiples of 8, got {head_dim}, {head_dim_v}")
-    return dtype, head_dim, head_dim_v, q.shape[2] // k.shape[2]
+    arch = _device_arch()
+    if not _can_implement(kind, dtype, head_dim, head_dim_v, cfg.causal, arch):
+        raise ValueError(
+            f"FA4 {kind} kernel cannot run head_dim={head_dim}, head_dim_v={head_dim_v} "
+            f"({q.dtype}) on sm_{arch}: tile does not fit the shared-memory budget "
+            "or the head dims exceed what the kernel supports (<= 128 on sm_8x/sm_120)"
+        )
+    return dtype, head_dim, head_dim_v, q.shape[2] // k.shape[2], arch
 
 
 class CuteBackend:
     def _tree(self, cfg, kind, q, k, v, aux, **extra):
-        dtype, hd, hdv, ratio = _validate(cfg, q, k, v)
-        tree = dict(_get_static(cfg, dtype, hd, hdv, ratio, _device_arch(), kind))
+        dtype, hd, hdv, ratio, arch = _validate(cfg, kind, q, k, v)
+        tree = dict(_get_static(cfg, dtype, hd, hdv, ratio, arch, kind))
         tree.update(q=q, k=k, v=v, **extra)
         tree.update({f"aux{i}": a for i, a in enumerate(aux)})
         specs = {"q": _QKV_SPEC, "k": _QKV_SPEC, "v": _QKV_SPEC}
@@ -495,8 +526,7 @@ class CuteBackend:
         s_q_pad = _round_up(s_q, _BWD_TILE_M)
         d_pad = _round_up(d, 32)
         f32 = jnp.float32
-        dtype, hd, hdv, ratio = _validate(cfg, q, k, v)
-        arch = _device_arch()
+        dtype, hd, hdv, ratio, arch = _validate(cfg, "bwd", q, k, v)
         st = _get_static(cfg, dtype, hd, hdv, ratio, arch, "bwd")
 
         dpsum, lse_log2, dq_accum = cutejax.call(

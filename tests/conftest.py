@@ -24,20 +24,30 @@ def has_cuda() -> bool:
         return False
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "cuda: needs a CUDA device (touches the cute backend)"
+    )
+
+
 def pytest_collection_modifyitems(config, items):
-    # The whole suite exercises the cute backend (or compares against it).
+    # Only tests that reach the cute backend need a GPU; the reference-backend
+    # wiring / mask / vmap tests run anywhere.
     if has_cuda():
         return
     skip = pytest.mark.skip(reason="no CUDA device")
     for item in items:
-        item.add_marker(skip)
+        if "cuda" in item.keywords:
+            item.add_marker(skip)
 
 
 TOL = {
     jnp.dtype(jnp.float32): dict(atol=2e-5, rtol=2e-5),
-    # Matching flash-attention's testing convention: kernel error is allowed a
-    # small multiple of the reference implementation's own rounding error, and
-    # half dtypes get flat tolerances scaled to their epsilon.
+    # Flat tolerances, calibrated for the suite's unit-variance inputs (scale
+    # 1/sqrt(d) -> logits with std ~1, a fairly flat softmax): measured kernel
+    # error is ~8x below these. They are NOT valid for sharper attention,
+    # where the bf16 rounding of P before the PV matmul dominates; those tests
+    # use `fa_tol` instead.
     jnp.dtype(jnp.bfloat16): dict(atol=3e-2, rtol=3e-2),
     jnp.dtype(jnp.float16): dict(atol=5e-3, rtol=5e-3),
 }
@@ -54,3 +64,45 @@ def random_qkv(rng, b, s_q, s_kv, h_q, h_kv, d, d_v=None, dtype=jnp.float32):
     d_v = d if d_v is None else d_v
     mk = lambda *shape: jnp.asarray(rng.standard_normal(shape), dtype)
     return mk(b, s_q, h_q, d), mk(b, s_kv, h_kv, d), mk(b, s_kv, h_kv, d_v)
+
+
+# ---------------------------------------------------------------- FA-style tolerance
+#
+# flash-attention's test convention: the kernel's error against an fp32
+# reference may be at most ~2x the error of the *same math done with half-
+# precision rounding* against that fp32 reference. That makes the bound
+# follow the actual conditioning of the inputs instead of a flat constant.
+
+
+def half_rounded_attn(q, k, v, *, causal=False, window_size=None, scale=None, mask_mod=None):
+    """The reference math with the kernel's roundings: P is rounded to the
+    input dtype before the PV matmul, and the output to the input dtype."""
+    import math
+
+    from fa4_jax.reference import _expand_kv, dense_mask
+
+    dtype = q.dtype
+    f32 = jnp.float32
+    b, s_q, h, d = q.shape
+    s_kv = k.shape[1]
+    scale = float(scale if scale is not None else 1.0 / math.sqrt(d))
+    window = window_size if window_size is not None else (None, None)
+    s = jnp.einsum("bqhd,bkhd->bhqk", q.astype(f32), _expand_kv(k, h).astype(f32)) * scale
+    mask = dense_mask(b, h, s_q, s_kv, causal, window, mask_mod)
+    if mask is not None:
+        s = jnp.where(mask, s, -jnp.inf)
+    p = jax.nn.softmax(s, axis=-1)
+    if mask is not None:
+        p = jnp.where(mask.any(-1, keepdims=True), p, 0.0)
+    p = p.astype(dtype).astype(f32)
+    out = jnp.einsum("bhqk,bkhd->bqhd", p, _expand_kv(v, h).astype(f32))
+    return out.astype(dtype)
+
+
+def fa_tol(want, half, dtype, *, mult=2.0):
+    """Tolerance kwargs for assert_close: 2x the half-precision reference's
+    own error plus the dtype's flat atol as a floor."""
+    want = np.asarray(jnp.asarray(want, jnp.float32))
+    half = np.asarray(jnp.asarray(half, jnp.float32))
+    ref_err = float(np.abs(want - half).max())
+    return dict(atol=mult * ref_err + TOL[jnp.dtype(dtype)]["atol"], rtol=0.0)

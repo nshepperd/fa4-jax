@@ -9,36 +9,48 @@ parametrized sweeps mostly reuse a handful of compiles.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from conftest import assert_close, random_qkv
+from conftest import assert_close, fa_tol, half_rounded_attn, random_qkv
 
 import fa4_jax
 from fa4_jax import (
     FnMask,
+    MaskMod,
+    and_masks,
     causal_mask,
     document_mask,
     flash_attn,
+    or_masks,
     sliding_window_mask,
 )
+
+pytestmark = pytest.mark.cuda
 
 DTYPES = [jnp.bfloat16, jnp.float16]
 
 # (b, s_q, s_kv, h_kv, gqa, d, d_v): tile-aligned, ragged tails, tiny, GQA,
-# mixed head dims.
+# mixed head dims, s_q != s_kv both ways (bottom-right alignment), decode.
 SHAPES = [
     (1, 128, 128, 1, 1, 64, None),
     (2, 256, 256, 4, 1, 64, None),
     (1, 200, 200, 2, 1, 64, None),
     (2, 37, 71, 2, 1, 64, None),
     (1, 1, 1, 1, 1, 64, None),
+    (1, 1, 256, 2, 1, 64, None),  # decode: one query, many keys
+    (1, 256, 64, 2, 1, 64, None),  # s_q > s_kv
     (2, 128, 128, 2, 2, 64, None),  # GQA
     (1, 192, 192, 1, 4, 64, None),  # GQA
+    (1, 100, 164, 2, 2, 64, None),  # GQA + s_q != s_kv + ragged
     (1, 128, 128, 2, 1, 128, None),  # head_dim 128
     (1, 96, 96, 2, 1, 32, None),
+    (1, 128, 128, 2, 1, 96, None),  # head_dim 96: padded to the 16-multiple tile
     (1, 128, 128, 2, 1, 64, 32),  # d_v != d
+    (1, 128, 128, 2, 1, 64, 128),  # d_v > d
 ]
 
 
@@ -55,39 +67,131 @@ def _both(q, k, v, **kw):
     return got, want
 
 
+def _tangents(q, k, v, seed):
+    rng = np.random.default_rng(seed)
+    return tuple(jnp.asarray(rng.standard_normal(t.shape), q.dtype) for t in (q, k, v))
+
+
+def _grads(q, k, v, cot=None, **kw):
+    def loss(backend):
+        def f(q, k, v):
+            out = flash_attn(q, k, v, backend=backend, **kw)
+            return out.sum() if cot is None else (out * cot).sum()
+
+        return f
+
+    got = jax.grad(loss("cute"), argnums=(0, 1, 2))(q, k, v)
+    want = jax.grad(loss("reference"), argnums=(0, 1, 2))(q, k, v)
+    return got, want
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("causal", [False, True])
 def test_fwd(shape, dtype, causal):
-    if causal and shape[1] != shape[2]:
-        pytest.skip("causal alignment for s_q != s_kv not pinned down")
     q, k, v = _mk(shape, dtype)
     got, want = _both(q, k, v, causal=causal)
     assert_close(got, want, dtype=dtype)
 
 
+WINDOWS = [(32, 32), (16, 0), (0, 16), (128, 7), (None, 5), (3, None)]
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("window", [(32, 32), (16, 0), (0, 16), (128, 7), (None, 5), (3, None)])
-def test_fwd_window(dtype, window):
-    q, k, v = _mk((2, 200, 200, 2, 1, 64, None), dtype)
+@pytest.mark.parametrize("window", WINDOWS)
+@pytest.mark.parametrize("s_q,s_kv", [(200, 200), (80, 200), (200, 80)])
+def test_fwd_window(dtype, window, s_q, s_kv):
+    q, k, v = _mk((2, s_q, s_kv, 2, 1, 64, None), dtype)
     got, want = _both(q, k, v, window_size=window)
     assert_close(got, want, dtype=dtype)
 
 
 @pytest.mark.parametrize("shape", SHAPES)
-def test_fwd_lse(shape):
+@pytest.mark.parametrize("kw", [dict(), dict(causal=True), dict(window_size=(24, 8))])
+def test_fwd_lse(shape, kw):
+    """lse at 1e-3 is the sharpest edge detector here: one dropped key shifts
+    it by ~1/s."""
     q, k, v = _mk(shape, jnp.bfloat16)
-    got, lse_got = flash_attn(q, k, v, return_lse=True, backend="cute")
-    want, lse_want = flash_attn(q, k, v, return_lse=True, backend="reference")
+    got, lse_got = flash_attn(q, k, v, return_lse=True, backend="cute", **kw)
+    want, lse_want = flash_attn(q, k, v, return_lse=True, backend="reference", **kw)
     assert_close(got, want, dtype=q.dtype)
     assert_close(lse_got, lse_want, atol=1e-3, rtol=1e-3)
 
+
+def test_custom_scale():
+    q, k, v = _mk((1, 128, 128, 2, 1, 64, None), jnp.bfloat16)
+    got, want = _both(q, k, v, scale=0.5)
+    assert_close(got, want, dtype=q.dtype)
+    ref_default = flash_attn(q, k, v, backend="reference")
+    assert np.abs(np.asarray(want - ref_default, np.float32)).max() > 1e-2
+
+
+# ---------------------------------------------------------------- sharp softmax
+#
+# Unit-variance inputs with scale 1/sqrt(d) give a flat softmax, where the
+# kernels' dominant rounding (P to bf16 before P@V) barely shows. Scaling q
+# up makes rows peaky, moves the running max across KV blocks (online-softmax
+# rescaling), and grows the error past the flat tolerances -- so these use
+# the flash-attention rule: <= 2x the half-precision reference's own error.
+
+SHARP_GAIN = 4.0
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("kw", [dict(), dict(causal=True), dict(window_size=(32, 16))])
+def test_fwd_sharp(dtype, kw):
+    q, k, v = _mk((2, 256, 256, 2, 1, 64, None), dtype)
+    q = q * SHARP_GAIN
+    got, want = _both(q, k, v, **kw)
+    half = half_rounded_attn(q, k, v, **kw)
+    assert_close(got, want, **fa_tol(want, half, dtype))
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("kw", [dict(causal=True), dict(window_size=(32, 16))])
+def test_grad_sharp(dtype, kw):
+    q, k, v = _mk((2, 256, 256, 2, 1, 64, None), dtype)
+    q = q * SHARP_GAIN
+    got, want = _grads(q, k, v, **kw)
+    half = jax.grad(lambda *a: half_rounded_attn(*a, **kw).sum(), argnums=(0, 1, 2))(q, k, v)
+    for g, w, h, name in zip(got, want, half, "qkv"):
+        assert_close(g, w, **fa_tol(w, h, dtype), msg=f"d{name}")
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_jvp_sharp(dtype):
+    q, k, v = _mk((2, 256, 256, 2, 1, 64, None), dtype)
+    q = q * SHARP_GAIN
+    dq, dk, dv = _tangents(q, k, v, 31)
+    f = lambda be: lambda q, k, v: flash_attn(q, k, v, causal=True, backend=be)
+    _, t_got = jax.jvp(f("cute"), (q, k, v), (dq, dk, dv))
+    _, t_want = jax.jvp(f("reference"), (q, k, v), (dq, dk, dv))
+    _, t_half = jax.jvp(lambda *a: half_rounded_attn(*a, causal=True), (q, k, v), (dq, dk, dv))
+    assert_close(t_got, t_want, **fa_tol(t_want, t_half, dtype))
+
+
+# ---------------------------------------------------------------- mask mods
 
 # Masks key the compile cache by class + static fields, so these could be
 # built per call; FnMask is the exception (its lambda hashes by identity).
 _WINDOW_MM = sliding_window_mask(24, 8)
 _CAUSAL_MM = causal_mask()
 _HEAD_MM = FnMask(lambda b, h, q, kv: (kv <= q) | (h == 0), label="h0-full")
+_STRIDE_MM = FnMask(lambda b, h, q, kv: (kv <= q) & (kv % 3 == 0), label="stride3")
+
+
+@dataclass(frozen=True)
+class _PrefixMask(MaskMod):
+    """A second array-leaf mask, to combine with document_mask (n_aux = 2)."""
+
+    prefix_len: jax.Array
+
+    def __call__(self, b, h, q, kv):
+        return kv < self.prefix_len[b]
+
+
+def _doc_ids(s, n_docs, b=2):
+    return jnp.asarray(np.repeat(np.arange(n_docs), -(-s // n_docs))[:s])[None].repeat(b, 0).astype(jnp.int32)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -104,10 +208,31 @@ def test_mask_mod_equals_native_causal():
     assert_close(got, want, dtype=q.dtype)
 
 
+def test_mask_mod_causal_is_top_left():
+    """causal_mask() sees raw indices (top-left); causal=True is bottom-right.
+    They differ when s_q != s_kv, and each backend agrees with itself."""
+    q, k, v = _mk((1, 64, 128, 1, 1, 64, None), jnp.bfloat16)
+    got, want = _both(q, k, v, mask_mod=_CAUSAL_MM)
+    assert_close(got, want, dtype=q.dtype)
+    native = flash_attn(q, k, v, causal=True, backend="cute")
+    assert np.abs(np.asarray(got - native, np.float32)).max() > 0.1
+
+
 def test_mask_mod_head_dependent():
     q, k, v = _mk((2, 128, 128, 3, 1, 64, None), jnp.bfloat16)
     got, want = _both(q, k, v, mask_mod=_HEAD_MM)
     assert_close(got, want, dtype=q.dtype)
+
+
+def test_distinct_fnmasks_get_distinct_kernels():
+    """Two FnMasks wrapping different lambdas must not share a compiled
+    kernel (the fn is a static treedef field, hashed by identity)."""
+    q, k, v = _mk((1, 128, 128, 1, 1, 64, None), jnp.bfloat16)
+    a, want_a = _both(q, k, v, mask_mod=_HEAD_MM)
+    b, want_b = _both(q, k, v, mask_mod=_STRIDE_MM)
+    assert_close(a, want_a, dtype=q.dtype)
+    assert_close(b, want_b, dtype=q.dtype)
+    assert np.abs(np.asarray(a - b, np.float32)).max() > 0.1
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -121,6 +246,25 @@ def test_mask_mod_document_aux(dtype):
     docs = jnp.asarray(np.stack([ids, ids[::-1].copy()]), dtype=jnp.int32)
     got, want = _both(q, k, v, mask_mod=document_mask(docs))
     assert_close(got, want, dtype=dtype)
+
+
+def test_mask_mod_combinators_and_multi_aux():
+    """and_masks / or_masks on the kernels, including a mask with two array
+    leaves (aux ordering through the treedef)."""
+    s = 160
+    q, k, v = _mk((2, s, s, 2, 1, 64, None), jnp.bfloat16)
+    docs = _doc_ids(s, 3)
+    prefix = _PrefixMask(jnp.asarray([40, 100], jnp.int32))
+    for m in (
+        and_masks(document_mask(docs), prefix),
+        or_masks(document_mask(docs), prefix),
+        and_masks(_CAUSAL_MM, or_masks(document_mask(docs), _WINDOW_MM)),
+    ):
+        got, want = _both(q, k, v, mask_mod=m)
+        assert_close(got, want, dtype=q.dtype, msg=repr(m))
+        got, want = _grads(q, k, v, mask_mod=m)
+        for g, w, name in zip(got, want, "qkv"):
+            assert_close(g, w, dtype=q.dtype, msg=f"{m!r} d{name}")
 
 
 def test_mask_mod_aux_change_reuses_kernel():
@@ -145,49 +289,35 @@ def test_mask_mod_aux_change_reuses_kernel():
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("causal", [False, True])
 def test_grad(shape, dtype, causal):
-    if causal and shape[1] != shape[2]:
-        pytest.skip("causal alignment for s_q != s_kv not pinned down")
     q, k, v = _mk(shape, dtype)
     rng = np.random.default_rng(1)
     cot = jnp.asarray(rng.standard_normal((*q.shape[:3], v.shape[3])), dtype)
-
-    def loss(backend):
-        return lambda q, k, v: (flash_attn(q, k, v, causal=causal, backend=backend) * cot).sum()
-
-    got = jax.grad(loss("cute"), argnums=(0, 1, 2))(q, k, v)
-    want = jax.grad(loss("reference"), argnums=(0, 1, 2))(q, k, v)
+    got, want = _grads(q, k, v, cot, causal=causal)
     for g, w, name in zip(got, want, "qkv"):
         assert_close(g, w, dtype=dtype, msg=f"d{name}")
 
 
-@pytest.mark.parametrize("window", [(32, 32), (16, 0)])
-def test_grad_window(window):
-    q, k, v = _mk((1, 256, 256, 2, 1, 64, None), jnp.bfloat16)
-
-    def loss(backend):
-        return lambda q, k, v: flash_attn(q, k, v, window_size=window, backend=backend).sum()
-
-    got = jax.grad(loss("cute"), argnums=(0, 1, 2))(q, k, v)
-    want = jax.grad(loss("reference"), argnums=(0, 1, 2))(q, k, v)
-    for g, w in zip(got, want):
-        assert_close(g, w, dtype=q.dtype)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("window", [(32, 32), (16, 0), (0, 16), (None, 5)])
+@pytest.mark.parametrize("s_q,s_kv", [(256, 256), (100, 200), (200, 100)])
+def test_grad_window(dtype, window, s_q, s_kv):
+    q, k, v = _mk((1, s_q, s_kv, 2, 1, 64, None), dtype)
+    got, want = _grads(q, k, v, window_size=window)
+    for g, w, name in zip(got, want, "qkv"):
+        assert_close(g, w, dtype=dtype, msg=f"d{name}")
 
 
-@pytest.mark.parametrize("shape", [(2, 200, 200, 2, 4, 64, None), (1, 128, 128, 1, 2, 64, 32)])
+@pytest.mark.parametrize("shape", [(2, 200, 200, 2, 4, 64, None), (1, 128, 128, 1, 2, 64, 32), (1, 64, 128, 1, 8, 64, None)])
 @pytest.mark.parametrize("kw", [dict(window_size=(32, 8)), dict(mask_mod=_WINDOW_MM), dict(causal=True)])
 def test_grad_gqa(shape, kw):
     """GQA backward: dK/dV accumulate in fp32 across the q heads of a kv head,
     then go through the postprocess (dK scaled, dV not). Ragged tails, d_v !=
-    d, and every masking path, since the accumulator layouts are padded."""
+    d, s_q != s_kv, ratio 8, and every masking path, since the accumulator
+    layouts are padded."""
     q, k, v = _mk(shape, jnp.bfloat16)
     rng = np.random.default_rng(1)
     cot = jnp.asarray(rng.standard_normal((*q.shape[:3], v.shape[3])), jnp.bfloat16)
-
-    def loss(backend):
-        return lambda q, k, v: (flash_attn(q, k, v, backend=backend, **kw) * cot).sum()
-
-    got = jax.grad(loss("cute"), argnums=(0, 1, 2))(q, k, v)
-    want = jax.grad(loss("reference"), argnums=(0, 1, 2))(q, k, v)
+    got, want = _grads(q, k, v, cot, **kw)
     for g, w, name in zip(got, want, "qkv"):
         assert_close(g, w, dtype=q.dtype, msg=f"d{name}")
 
@@ -196,12 +326,7 @@ def test_grad_gqa(shape, kw):
 def test_grad_mask_mod(dtype):
     """mask_mod in reverse mode (local addition to the vendored backward)."""
     q, k, v = _mk((2, 160, 160, 2, 1, 64, None), dtype)
-
-    def loss(backend):
-        return lambda q, k, v: flash_attn(q, k, v, mask_mod=_WINDOW_MM, backend=backend).sum()
-
-    got = jax.grad(loss("cute"), argnums=(0, 1, 2))(q, k, v)
-    want = jax.grad(loss("reference"), argnums=(0, 1, 2))(q, k, v)
+    got, want = _grads(q, k, v, mask_mod=_WINDOW_MM)
     for g, w, name in zip(got, want, "qkv"):
         assert_close(g, w, dtype=dtype, msg=f"d{name}")
 
@@ -209,15 +334,45 @@ def test_grad_mask_mod(dtype):
 def test_grad_mask_mod_aux():
     s = 192
     q, k, v = _mk((2, s, s, 2, 1, 64, None), jnp.bfloat16)
-    ids = jnp.asarray(np.repeat(np.arange(4), s // 4))[None].repeat(2, 0).astype(jnp.int32)
+    got, want = _grads(q, k, v, mask_mod=document_mask(_doc_ids(s, 4)))
+    for g, w in zip(got, want):
+        assert_close(g, w, dtype=q.dtype)
 
-    def loss(backend):
-        return lambda q, k, v: flash_attn(q, k, v, mask_mod=document_mask(ids), backend=backend).sum()
 
+def test_grad_with_unused_lse():
+    """return_lse=True, differentiating out only: the lse cotangent is a
+    symbolic zero, so the cute backward (which has no d_lse) is used."""
+    q, k, v = _mk((1, 128, 128, 2, 1, 64, None), jnp.bfloat16)
+    loss = lambda be: lambda q, k, v: flash_attn(q, k, v, causal=True, return_lse=True, backend=be)[0].sum()
     got = jax.grad(loss("cute"), argnums=(0, 1, 2))(q, k, v)
     want = jax.grad(loss("reference"), argnums=(0, 1, 2))(q, k, v)
     for g, w in zip(got, want):
         assert_close(g, w, dtype=q.dtype)
+
+
+def test_grad_through_lse_unsupported():
+    q, k, v = _mk((1, 64, 64, 1, 1, 64, None), jnp.bfloat16)
+    f = lambda q: flash_attn(q, k, v, return_lse=True, backend="cute")[1].sum()
+    with pytest.raises(NotImplementedError, match="lse"):
+        jax.grad(f)(q)
+
+
+def test_grad_partial_argnums():
+    """grad w.r.t. k only: q/v tangents are symbolic zeros into the JVP rule."""
+    q, k, v = _mk((1, 128, 128, 2, 1, 64, None), jnp.bfloat16)
+    loss = lambda be: lambda k: flash_attn(q, k, v, causal=True, backend=be).sum()
+    assert_close(jax.grad(loss("cute"))(k), jax.grad(loss("reference"))(k), dtype=k.dtype)
+
+
+def test_grad_empty_rows_finite():
+    """Rows with no visible key: zero output, -inf lse, and the backward must
+    stay finite (P = 0 on those rows, not NaN from exp(-inf - -inf))."""
+    q, k, v = _mk((1, 64, 64, 1, 1, 64, None), jnp.bfloat16)
+    got, want = _grads(q, k, v, window_size=(None, -3))
+    for g, w, name in zip(got, want, "qkv"):
+        assert np.isfinite(np.asarray(g, np.float32)).all(), name
+        assert_close(g, w, dtype=q.dtype, msg=f"d{name}")
+    assert (np.asarray(got[0][:, :3], np.float32) == 0).all()
 
 
 @pytest.mark.parametrize("native", [dict(causal=True), dict(window_size=(48, 16))])
@@ -227,22 +382,16 @@ def test_native_mask_combines_with_mask_mod(native):
     mod). Checked for fwd, grad, and jvp."""
     s = 160
     q, k, v = _mk((2, s, s, 2, 1, 64, None), jnp.bfloat16)
-    ids = jnp.asarray(np.repeat(np.arange(4), s // 4))[None].repeat(2, 0).astype(jnp.int32)
-    kw = dict(mask_mod=document_mask(ids), **native)
+    kw = dict(mask_mod=document_mask(_doc_ids(s, 4)), **native)
 
     got, want = _both(q, k, v, **kw)
     assert_close(got, want, dtype=q.dtype, msg="fwd")
 
-    def loss(backend):
-        return lambda q, k, v: flash_attn(q, k, v, backend=backend, **kw).sum()
-
-    gg = jax.grad(loss("cute"), argnums=(0, 1, 2))(q, k, v)
-    gw = jax.grad(loss("reference"), argnums=(0, 1, 2))(q, k, v)
+    gg, gw = _grads(q, k, v, **kw)
     for g, w in zip(gg, gw):
         assert_close(g, w, dtype=q.dtype, msg="grad")
 
-    rng = np.random.default_rng(9)
-    dq, dk, dv = (jnp.asarray(rng.standard_normal(t.shape), q.dtype) for t in (q, k, v))
+    dq, dk, dv = _tangents(q, k, v, 9)
     f = lambda backend: lambda q, k, v: flash_attn(q, k, v, backend=backend, **kw)
     _, t_got = jax.jvp(f("cute"), (q, k, v), (dq, dk, dv))
     _, t_want = jax.jvp(f("reference"), (q, k, v), (dq, dk, dv))
@@ -256,11 +405,8 @@ def test_native_mask_combines_with_mask_mod(native):
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("causal", [False, True])
 def test_jvp(shape, dtype, causal):
-    if causal and shape[1] != shape[2]:
-        pytest.skip("causal alignment for s_q != s_kv not pinned down")
     q, k, v = _mk(shape, dtype)
-    rng = np.random.default_rng(2)
-    dq, dk, dv = (jnp.asarray(rng.standard_normal(t.shape), dtype) for t in (q, k, v))
+    dq, dk, dv = _tangents(q, k, v, 2)
 
     def f(backend):
         return lambda q, k, v: flash_attn(q, k, v, causal=causal, backend=backend)
@@ -271,27 +417,27 @@ def test_jvp(shape, dtype, causal):
     assert_close(t_got, t_want, dtype=dtype, msg="tangent")
 
 
+@pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("window", [(32, 32), (16, 0)])
-def test_jvp_window(window):
-    q, k, v = _mk((2, 200, 200, 2, 1, 64, None), jnp.bfloat16)
-    rng = np.random.default_rng(3)
-    dq, dk, dv = (jnp.asarray(rng.standard_normal(t.shape), q.dtype) for t in (q, k, v))
+@pytest.mark.parametrize("s_q,s_kv", [(200, 200), (80, 200), (200, 80)])
+def test_jvp_window(dtype, window, s_q, s_kv):
+    q, k, v = _mk((2, s_q, s_kv, 2, 1, 64, None), dtype)
+    dq, dk, dv = _tangents(q, k, v, 3)
 
     def f(backend):
         return lambda q, k, v: flash_attn(q, k, v, window_size=window, backend=backend)
 
     _, t_got = jax.jvp(f("cute"), (q, k, v), (dq, dk, dv))
     _, t_want = jax.jvp(f("reference"), (q, k, v), (dq, dk, dv))
-    assert_close(t_got, t_want, dtype=q.dtype)
+    assert_close(t_got, t_want, dtype=dtype)
 
 
 def test_jvp_mask_mod_and_aux():
     """Unlike reverse mode, forward mode supports mask mods on the kernels."""
     s = 160
     q, k, v = _mk((2, s, s, 2, 1, 64, None), jnp.bfloat16)
-    rng = np.random.default_rng(4)
-    dq, dk, dv = (jnp.asarray(rng.standard_normal(t.shape), q.dtype) for t in (q, k, v))
-    ids = jnp.asarray(np.repeat(np.arange(4), s // 4))[None].repeat(2, 0).astype(jnp.int32)
+    dq, dk, dv = _tangents(q, k, v, 4)
+    ids = _doc_ids(s, 4)
 
     def f(backend):
         return lambda q, k, v: flash_attn(q, k, v, mask_mod=document_mask(ids), backend=backend)
@@ -301,11 +447,19 @@ def test_jvp_mask_mod_and_aux():
     assert_close(t_got, t_want, dtype=q.dtype)
 
 
+def test_jvp_aux_tangent_rejected():
+    """A float mask leaf with a tangent is rejected before any kernel runs."""
+    q, k, v = _mk((1, 64, 64, 1, 1, 64, None), jnp.bfloat16)
+    ids = jnp.zeros((1, 64), jnp.float32)
+    f = lambda ids: flash_attn(q, k, v, mask_mod=document_mask(ids), backend="cute")
+    with pytest.raises(NotImplementedError, match="aux"):
+        jax.jvp(f, (ids,), (jnp.ones_like(ids),))
+
+
 def test_jvp_lse_tangent():
     """t_lse = mu comes out of the tangent kernel's second output."""
     q, k, v = _mk((2, 128, 128, 2, 1, 64, None), jnp.bfloat16)
-    rng = np.random.default_rng(5)
-    dq, dk, dv = (jnp.asarray(rng.standard_normal(t.shape), q.dtype) for t in (q, k, v))
+    dq, dk, dv = _tangents(q, k, v, 5)
 
     def f(backend):
         return lambda q, k, v: flash_attn(q, k, v, return_lse=True, backend=backend)[1]
@@ -318,8 +472,7 @@ def test_jvp_lse_tangent():
 def test_jvp_gqa():
     """Forward mode supports GQA (nothing accumulates into kv shapes)."""
     q, k, v = _mk((2, 128, 128, 2, 2, 64, None), jnp.bfloat16)
-    rng = np.random.default_rng(6)
-    dq, dk, dv = (jnp.asarray(rng.standard_normal(t.shape), q.dtype) for t in (q, k, v))
+    dq, dk, dv = _tangents(q, k, v, 6)
 
     def f(backend):
         return lambda q, k, v: flash_attn(q, k, v, causal=True, backend=backend)
@@ -329,11 +482,59 @@ def test_jvp_gqa():
     assert_close(t_got, t_want, dtype=q.dtype)
 
 
+def _poison_shared_memory():
+    """Run XLA reductions over NaN / -inf so the SMs' shared memory is left
+    full of non-finite values (what an earlier masked-softmax leaves behind)."""
+    x = jnp.full((2048, 2048), -jnp.inf, jnp.float32)
+
+    @jax.jit
+    def f(x):
+        return (
+            jnp.max(x, axis=1).sum()
+            + jax.nn.softmax(x, axis=-1).sum()
+            + (x.astype(jnp.bfloat16) @ x.astype(jnp.bfloat16)).sum()
+        )
+
+    f(x).block_until_ready()
+
+
+@pytest.mark.parametrize("kw", [dict(), dict(causal=True), dict(window_size=(16, 8))])
+@pytest.mark.parametrize("shape", [(2, 37, 71, 2, 1, 64, None), (1, 1, 200, 1, 1, 64, None)])
+def test_ragged_tail_immune_to_stale_smem(shape, kw):
+    """Regression: the KV tiles' seqlen tail is never loaded from gmem, so
+    whatever the previous kernel left in shared memory sits there. The
+    forward only needs the *scores* masked (P = 0 there), but the tangent
+    kernel also forms tS from those columns and 0 * (stale inf) = NaN poisoned
+    every row. The tail must be zero-filled (or otherwise excluded) in all
+    three passes."""
+    q, k, v = _mk(shape, jnp.bfloat16)
+    dq, dk, dv = _tangents(q, k, v, 40)
+    f = lambda be: lambda q, k, v: flash_attn(q, k, v, backend=be, **kw)
+    jit_fwd = jax.jit(f("cute"))
+    jit_jvp = jax.jit(lambda q, k, v, dq, dk, dv: jax.jvp(f("cute"), (q, k, v), (dq, dk, dv))[1])
+    jit_grad = jax.jit(jax.grad(lambda q, k, v: f("cute")(q, k, v).sum(), argnums=(0, 1, 2)))
+    for op, args, want in (
+        (jit_fwd, (q, k, v), f("reference")(q, k, v)),
+        (jit_jvp, (q, k, v, dq, dk, dv), jax.jvp(f("reference"), (q, k, v), (dq, dk, dv))[1]),
+    ):
+        op(*args).block_until_ready()  # compile first, then poison, then run
+        _poison_shared_memory()
+        got = op(*args)
+        assert not np.isnan(np.asarray(got, np.float32)).any()
+        assert_close(got, want, dtype=q.dtype)
+    jit_grad(q, k, v)
+    _poison_shared_memory()
+    got = jit_grad(q, k, v)
+    want = jax.grad(lambda q, k, v: f("reference")(q, k, v).sum(), argnums=(0, 1, 2))(q, k, v)
+    for g, w, name in zip(got, want, "qkv"):
+        assert not np.isnan(np.asarray(g, np.float32)).any(), name
+        assert_close(g, w, dtype=q.dtype, msg=f"d{name}")
+
+
 def test_empty_rows_zero_not_nan():
     """Fully-masked rows: forward zeros and tangent zeros, no NaNs."""
     q, k, v = _mk((1, 64, 64, 1, 1, 64, None), jnp.bfloat16)
-    rng = np.random.default_rng(8)
-    dq, dk, dv = (jnp.asarray(rng.standard_normal(t.shape), q.dtype) for t in (q, k, v))
+    dq, dk, dv = _tangents(q, k, v, 8)
     f = lambda q, k, v: flash_attn(q, k, v, window_size=(-8, 16), backend="cute")
     out, t_out = jax.jvp(f, (q, k, v), (dq, dk, dv))
     out, t_out = np.asarray(out, np.float32), np.asarray(t_out, np.float32)
@@ -341,6 +542,37 @@ def test_empty_rows_zero_not_nan():
     assert (out[0, -8:] == 0).all() and (t_out[0, -8:] == 0).all()
 
 
-def test_reference_vs_fa4_module_docstring_layout():
+# ---------------------------------------------------------------- jit / lowering
+
+
+def test_jit_fwd_grad_jvp():
+    """Under an outer jax.jit the primitives go through their mlir lowering
+    (lower_fun) rather than the eager impl; numbers must be identical."""
+    q, k, v = _mk((1, 128, 128, 2, 1, 64, None), jnp.bfloat16)
+    dq, dk, dv = _tangents(q, k, v, 10)
+    f = lambda q, k, v: flash_attn(q, k, v, causal=True, return_lse=True, backend="cute")
+    loss = lambda q, k, v: f(q, k, v)[0].sum()
+    tan = lambda q, k, v, dq, dk, dv: jax.jvp(f, (q, k, v), (dq, dk, dv))[1]
+
+    for eager, jitted in (
+        (f, jax.jit(f)),
+        (jax.grad(loss, argnums=(0, 1, 2)), jax.jit(jax.grad(loss, argnums=(0, 1, 2)))),
+    ):
+        for a, b in zip(eager(q, k, v), jitted(q, k, v)):
+            assert_close(a, b, atol=0, rtol=0)
+    for a, b in zip(tan(q, k, v, dq, dk, dv), jax.jit(tan)(q, k, v, dq, dk, dv)):
+        assert_close(a, b, atol=0, rtol=0)
+
+
+def test_remat():
+    q, k, v = _mk((1, 128, 128, 2, 1, 64, None), jnp.bfloat16)
+    loss = lambda q, k, v: flash_attn(q, k, v, causal=True, backend="cute").sum()
+    got = jax.grad(jax.checkpoint(loss), argnums=(0, 1, 2))(q, k, v)
+    want = jax.grad(loss, argnums=(0, 1, 2))(q, k, v)
+    for a, b in zip(got, want):
+        assert_close(a, b, atol=0, rtol=0)
+
+
+def test_public_surface():
     """fa4_jax package exposes what the README promises."""
     assert {"flash_attn", "MaskMod", "reference_attn"} <= set(fa4_jax.__all__)

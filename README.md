@@ -47,8 +47,15 @@ class PrefixLM(MaskMod):
         return (kv < self.prefix_len[b]) | ((kv <= q) & (q - kv <= self.window))
 ```
 
+`causal` and `window_size` are bottom-right aligned when `s_q != s_kv` (the
+flash-attention convention: the last query lines up with the last key, so
+decode / chunked prefill just works). Mask mods see raw indices, so
+`mask_mod=causal_mask()` is top-left and only equals `causal=True` when the
+lengths match.
+
 Restrictions (kernel-side, all checked with clear errors): fp16/bf16, head_dim
-a multiple of 8, no cotangent through `lse` in reverse mode. GQA works in all
+a multiple of 8 and ≤ 128 (the SM80/SM120 tile budget), no cotangent through
+`lse` in reverse mode. GQA works in all
 three passes (the backward accumulates dK/dV in fp32 across the q heads of
 each kv head). Mask mods work in all three passes — the backward's mask_mod
 support is a local addition to the vendored kernel. Combining
