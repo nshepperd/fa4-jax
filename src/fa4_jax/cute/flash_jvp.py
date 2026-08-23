@@ -560,6 +560,65 @@ class FlashAttentionJvpSm80(FlashAttentionForwardSm80):
         )
 
     @cute.jit
+    def load_K(
+        self,
+        gmem_tiled_copy: cute.TiledCopy,
+        tKgK: cute.Tensor,
+        tKsK: cute.Tensor,
+        tKcK: cute.Tensor,
+        t0KcK: cute.Tensor,
+        tKpK: cute.Tensor,
+        block: Int32,
+        smem_pipe_write: Int32,
+        seqlen: Int32,
+        need_predicates: cutlass.Constexpr,
+    ):
+        """K/dK tile load with the seqlen tail *zero-filled*.
+
+        The forward's load_K skips the out-of-range rows and leaves stale
+        shared memory there ("we'll mask out the scores anyway"): fine for S,
+        whose tail columns are overwritten with -inf. The tangent kernel also
+        forms tS = dQ K^T + Q dK^T from those rows, and then P * tS with
+        P = 0 — which is NaN whenever the stale smem held inf/NaN (e.g. from
+        a preceding masked-softmax XLA kernel). Same predicate-as-zfill
+        scheme the forward already uses for V, where P @ V has the identical
+        hazard.
+        """
+        is_even_n_smem_k = self.tile_n % gmem_tiled_copy.tiler_mn[0].shape == 0
+        stage = smem_pipe_write if const_expr(self.num_stages > 1) else 0
+        if const_expr(need_predicates or not is_even_n_smem_k):
+            for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
+                # If tile_n doesn't evenly divide the tiled copy, only the last `n` needs checking
+                if (
+                    is_even_n_smem_k
+                    or n < cute.size(tKsK.shape[1]) - 1
+                    or tKcK[0, n, 0][0] < self.tile_n
+                ):
+                    predicate = tKpK[None, n, None] if const_expr(self.check_hdim_oob) else None
+                    if const_expr(need_predicates):
+                        seqlen_limit = seqlen - block * self.tile_n - tKcK[0][0]
+                        predicate_n = t0KcK[0, n, 0][0] < seqlen_limit
+                        predicate = cute.make_fragment_like(tKpK[None, 0, None])
+                        for k in cutlass.range_constexpr(cute.size(predicate.shape[1])):
+                            for i in cutlass.range_constexpr(cute.size(predicate.shape[0])):
+                                predicate[i, k] = (
+                                    tKpK[i, n, k] if const_expr(self.check_hdim_oob) else True
+                                ) and predicate_n
+                    cute.copy(
+                        gmem_tiled_copy,
+                        tKgK[None, n, None, block],
+                        tKsK[None, n, None, stage],
+                        pred=predicate,
+                    )
+        else:
+            cute.copy(
+                gmem_tiled_copy,
+                tKgK[None, None, None, block],
+                tKsK[None, None, None, stage],
+                pred=tKpK if const_expr(self.check_hdim_oob) else None,
+            )
+
+    @cute.jit
     def compute_one_n_block(
         self,
         n_blk: Int32,
