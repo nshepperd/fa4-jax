@@ -21,6 +21,7 @@ from fa4_jax import (
     document_mask,
     flash_attn,
     or_masks,
+    reference_attn,
     sliding_window_mask,
     static,
 )
@@ -119,9 +120,13 @@ def _dense(mask, b=2, h=3, s_q=7, s_kv=9):
 
 def test_dense_mask_semantics():
     q, kv = np.mgrid[0:7, 0:9]
-    np.testing.assert_array_equal(_dense(causal_mask()), np.broadcast_to(kv <= q, (2, 3, 7, 9)))
+    np.testing.assert_array_equal(
+        _dense(causal_mask()), np.broadcast_to(kv <= q, (2, 3, 7, 9))
+    )
     want = (q - kv <= 2) & (kv - q <= 1)
-    np.testing.assert_array_equal(_dense(sliding_window_mask(2, 1)), np.broadcast_to(want, (2, 3, 7, 9)))
+    np.testing.assert_array_equal(
+        _dense(sliding_window_mask(2, 1)), np.broadcast_to(want, (2, 3, 7, 9))
+    )
     a, b = causal_mask(), sliding_window_mask(2, None)
     np.testing.assert_array_equal(_dense(and_masks(a, b)), _dense(a) & _dense(b))
     np.testing.assert_array_equal(_dense(or_masks(a, b)), _dense(a) | _dense(b))
@@ -141,20 +146,28 @@ def test_document_mask_dense():
 def test_static_fields_key_the_treedef():
     """Static fields distinguish kernels; array fields don't; the treedef
     round-trips to a working callable (the path the cute backend takes)."""
-    a, b, c = sliding_window_mask(2, 1), sliding_window_mask(2, 1), sliding_window_mask(3, 1)
+    a, b, c = (
+        sliding_window_mask(2, 1),
+        sliding_window_mask(2, 1),
+        sliding_window_mask(3, 1),
+    )
     assert jax.tree.structure(a) == jax.tree.structure(b)
     assert jax.tree.structure(a) != jax.tree.structure(c)
     assert jax.tree.leaves(a) == []
 
     ids1 = jnp.asarray([[0, 0, 1]])
     ids2 = jnp.asarray([[0, 1, 1]])
-    assert jax.tree.structure(document_mask(ids1)) == jax.tree.structure(document_mask(ids2))
+    assert jax.tree.structure(document_mask(ids1)) == jax.tree.structure(
+        document_mask(ids2)
+    )
 
     full = and_masks(causal_mask(), document_mask(ids1))
     leaves, treedef = jax.tree.flatten(full)
     assert len(leaves) == 1
     rebuilt = treedef.unflatten(leaves)
-    np.testing.assert_array_equal(_dense(rebuilt, b=1, s_q=3, s_kv=3), _dense(full, b=1, s_q=3, s_kv=3))
+    np.testing.assert_array_equal(
+        _dense(rebuilt, b=1, s_q=3, s_kv=3), _dense(full, b=1, s_q=3, s_kv=3)
+    )
 
 
 def test_custom_mask_class():
@@ -176,7 +189,9 @@ def test_custom_mask_class():
     for bi, p in enumerate([2, 4]):
         np.testing.assert_array_equal(d[bi, 0], (kv < p) | ((kv <= q) & (kv % 2 == 0)))
 
-    q, k, v = random_qkv(np.random.default_rng(1), 2, 96, 96, 1, 1, 64, dtype=jnp.bfloat16)
+    q, k, v = random_qkv(
+        np.random.default_rng(1), 2, 96, 96, 1, 1, 64, dtype=jnp.bfloat16
+    )
     m = PrefixMask(jnp.asarray([16, 40], jnp.int32), stride=3)
     got = flash_attn(q, k, v, mask_mod=m, backend="cute")
     want = flash_attn(q, k, v, mask_mod=m, backend="reference")
@@ -202,3 +217,99 @@ def test_mask_arrays_not_differentiable():
     f = lambda ids: flash_attn(q, k, v, mask_mod=document_mask(ids)).sum()
     with pytest.raises(NotImplementedError, match="aux"):
         jax.grad(f)(ids)
+
+
+# ---------------------------------------------------------------- wiring vs plain autodiff
+#
+# flash_attn(backend="reference") runs the custom primitives (JVP rule,
+# tangent primitive, transpose rule) over the reference backend; reference_attn
+# is the same math under ordinary jax autodiff. Agreement pins the wiring.
+
+
+def _wiring_case(seed=7, b=2, s=24, h_q=2, h_kv=2, d=16):
+    rng = np.random.default_rng(seed)
+    q, k, v = random_qkv(rng, b, s, s, h_q, h_kv, d)
+    dq, dk, dv = (jnp.asarray(rng.standard_normal(t.shape), t.dtype) for t in (q, k, v))
+    return q, k, v, dq, dk, dv
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        dict(),
+        dict(causal=True),
+        dict(window_size=(4, 2)),
+        dict(mask_mod=sliding_window_mask(4, 2)),
+    ],
+)
+def test_wiring_grad_and_jvp(kw):
+    q, k, v, dq, dk, dv = _wiring_case()
+    f = lambda *a: flash_attn(*a, backend="reference", **kw)
+    g = lambda *a: reference_attn(*a, **kw)
+    _, tan_f = jax.jvp(f, (q, k, v), (dq, dk, dv))
+    _, tan_g = jax.jvp(g, (q, k, v), (dq, dk, dv))
+    assert_close(tan_f, tan_g, dtype=q.dtype)
+    gf = jax.grad(lambda *a: f(*a).sum(), argnums=(0, 1, 2))(q, k, v)
+    gg = jax.grad(lambda *a: g(*a).sum(), argnums=(0, 1, 2))(q, k, v)
+    for got, want in zip(gf, gg):
+        assert_close(got, want, dtype=q.dtype)
+
+
+def test_wiring_lse_is_differentiable():
+    """return_lse=True: grad and jvp flow through lse (t_lse and the d_lse
+    cotangent path of the transpose rule)."""
+    q, k, v, dq, dk, dv = _wiring_case(seed=8)
+
+    def f(q, k, v):
+        out, lse = flash_attn(q, k, v, return_lse=True, backend="reference")
+        return out.sum() + (lse * 0.7).sum()
+
+    def g(q, k, v):
+        out, lse = reference_attn(q, k, v, return_lse=True)
+        return out.sum() + (lse * 0.7).sum()
+
+    _, tan_f = jax.jvp(f, (q, k, v), (dq, dk, dv))
+    _, tan_g = jax.jvp(g, (q, k, v), (dq, dk, dv))
+    assert_close(tan_f, tan_g, atol=1e-3, rtol=1e-3)
+    gf = jax.grad(f, argnums=(0, 1, 2))(q, k, v)
+    gg = jax.grad(g, argnums=(0, 1, 2))(q, k, v)
+    for got, want in zip(gf, gg):
+        assert_close(got, want, dtype=q.dtype)
+
+
+def test_wiring_gqa_grad():
+    q, k, v, *_ = _wiring_case(seed=9, h_q=4, h_kv=2)
+    gf = jax.grad(
+        lambda *a: flash_attn(*a, backend="reference").sum(), argnums=(0, 1, 2)
+    )(q, k, v)
+    gg = jax.grad(lambda *a: reference_attn(*a).sum(), argnums=(0, 1, 2))(q, k, v)
+    for got, want in zip(gf, gg):
+        assert_close(got, want, dtype=q.dtype)
+
+
+def test_linearize_transpose_roundtrip():
+    """<J u, w> == <u, J^T w>: the transpose rule is the true adjoint of the
+    tangent map (dot-product test, independent of any reference)."""
+    q, k, v, *u = _wiring_case(seed=13, s=17)
+    f = lambda q, k, v: flash_attn(q, k, v, backend="reference")
+    out, f_jvp = jax.linearize(f, q, k, v)
+    w = jnp.asarray(np.random.default_rng(15).standard_normal(out.shape), out.dtype)
+    Ju = f_jvp(*u)
+    JTw = jax.linear_transpose(f_jvp, q, k, v)(w)
+    lhs = jnp.vdot(Ju, w)
+    rhs = sum(jnp.vdot(a, b) for a, b in zip(u, JTw))
+    assert_close(lhs, rhs, atol=1e-3, rtol=1e-3)
+
+
+def test_empty_rows_convention():
+    """No visible key -> out = 0, lse = -inf, zero gradient; never NaN."""
+    q, k, v, *_ = _wiring_case(seed=10, s=8)
+    out, lse = reference_attn(
+        q, k, v, window_size=(None, -3), return_lse=True
+    )  # q < 3 see nothing
+    assert np.isfinite(np.asarray(out)).all()
+    np.testing.assert_array_equal(np.asarray(out[:, :3]), 0)
+    assert np.isneginf(np.asarray(lse[:, :, :3])).all()
+    assert np.isfinite(np.asarray(lse[:, :, 3:])).all()
+    g = jax.grad(lambda q: reference_attn(q, k, v, window_size=(None, -3)).sum())(q)
+    assert np.isfinite(np.asarray(g)).all()

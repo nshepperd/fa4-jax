@@ -12,6 +12,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+# The reference computes in f32; on GPU that would silently be TF32 and the
+# oracle would be noisier than the kernels it judges.
+jax.config.update("jax_default_matmul_precision", "highest")
+
 
 def has_cuda() -> bool:
     try:
