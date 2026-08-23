@@ -420,7 +420,7 @@ class AttentionMask:
             has_fastdiv and mask_seqlen and const_expr(aux_data.tensors is not None)
         )
 
-        for r in cutlass.range_constexpr(nrow):
+        for r in cutlass.range(nrow, unroll_full=True):
             # Respect swap_AB: ROW/COL determine which coordinate component corresponds to Q/KV.
             local_row = tScS_mn[r, 0][ROW]
             global_row_idx = local_row + m_block * self.tile_m
@@ -434,7 +434,7 @@ class AttentionMask:
             if const_expr(wrap_aux_indices):
                 _, row_for_mod = divmod(row_for_mod, fastdiv_mods[0])
 
-            for col in cutlass.range_constexpr(ncol):
+            for col in cutlass.range(ncol, unroll_full=True):
                 col_idx_local = t0ScS_mn[0, col][COL]
                 # Convert to absolute column index
                 global_col_idx = thr_col_offset + col_idx_local + n_block * self.tile_n
@@ -457,15 +457,13 @@ class AttentionMask:
                 )
                 cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
                 if const_expr(mask_seqlen):
-                    out_of_bounds = (row_for_seqlen >= self.seqlen_q) or (
-                        global_col_idx >= self.seqlen_k
+                    in_bounds = (row_for_seqlen < self.seqlen_q) and (
+                        global_col_idx < self.seqlen_k
                     )
-                    if out_of_bounds:
-                        acc_S_mn[r, col] = -cutlass.Float32.inf
-                    else:
-                        acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
+                    keep = cond and in_bounds
                 else:
-                    acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
+                    keep = cond
+                acc_S_mn[r, col] = acc_S_mn[r, col] if keep else -cutlass.Float32.inf
 
     @cute.jit
     def apply_mask_mod_sm100_scalar(
