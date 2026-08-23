@@ -142,9 +142,7 @@ def test_mask_mod_aux_change_reuses_kernel():
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize(
-    "shape", [s for s in SHAPES if s[3] * s[4] == s[3]]  # no GQA (bwd restriction)
-)
+@pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("causal", [False, True])
 def test_grad(shape, dtype, causal):
     if causal and shape[1] != shape[2]:
@@ -175,10 +173,23 @@ def test_grad_window(window):
         assert_close(g, w, dtype=q.dtype)
 
 
-def test_grad_gqa_raises():
-    q, k, v = _mk((1, 64, 64, 2, 2, 64, None), jnp.bfloat16)
-    with pytest.raises(NotImplementedError, match="GQA"):
-        jax.grad(lambda q: flash_attn(q, k, v, backend="cute").sum())(q)
+@pytest.mark.parametrize("shape", [(2, 200, 200, 2, 4, 64, None), (1, 128, 128, 1, 2, 64, 32)])
+@pytest.mark.parametrize("kw", [dict(window_size=(32, 8)), dict(mask_mod=_WINDOW_MM), dict(causal=True)])
+def test_grad_gqa(shape, kw):
+    """GQA backward: dK/dV accumulate in fp32 across the q heads of a kv head,
+    then go through the postprocess (dK scaled, dV not). Ragged tails, d_v !=
+    d, and every masking path, since the accumulator layouts are padded."""
+    q, k, v = _mk(shape, jnp.bfloat16)
+    rng = np.random.default_rng(1)
+    cot = jnp.asarray(rng.standard_normal((*q.shape[:3], v.shape[3])), jnp.bfloat16)
+
+    def loss(backend):
+        return lambda q, k, v: (flash_attn(q, k, v, backend=backend, **kw) * cot).sum()
+
+    got = jax.grad(loss("cute"), argnums=(0, 1, 2))(q, k, v)
+    want = jax.grad(loss("reference"), argnums=(0, 1, 2))(q, k, v)
+    for g, w, name in zip(got, want, "qkv"):
+        assert_close(g, w, dtype=q.dtype, msg=f"d{name}")
 
 
 @pytest.mark.parametrize("dtype", DTYPES)

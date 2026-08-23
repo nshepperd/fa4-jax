@@ -48,8 +48,9 @@ class PrefixLM(MaskMod):
 ```
 
 Restrictions (kernel-side, all checked with clear errors): fp16/bf16, head_dim
-a multiple of 8, GQA forward-and-JVP-only (repeat kv heads for reverse-mode
-gradients). Mask mods work in all three passes — the backward's mask_mod
+a multiple of 8, no cotangent through `lse` in reverse mode. GQA works in all
+three passes (the backward accumulates dK/dV in fp32 across the q heads of
+each kv head). Mask mods work in all three passes — the backward's mask_mod
 support is a local addition to the vendored kernel. Combining
 causal/window_size with a mask_mod keeps the native band's KV-block skipping
 and runs the mod as a second masking pass over the visited tiles (also a

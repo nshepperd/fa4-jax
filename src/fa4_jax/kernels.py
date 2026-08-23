@@ -10,10 +10,11 @@ while its array fields stay runtime data.
 
 Kernel-side restrictions surface here as NotImplementedError:
 
-- backward (reverse mode): no GQA (upstream's dK/dV accumulation assumes
-  qhead_per_kvhead == 1 here) and no lse cotangent; mask_mod works (a local
-  addition to the vendored backward). The JVP tangent kernel supports all of
-  it.
+- backward (reverse mode): no lse cotangent; mask_mod works (a local addition
+  to the vendored backward). GQA works: the kernel atomically accumulates dK/dV
+  in fp32 across the q heads sharing a kv head, and two extra postprocess
+  launches convert them (see the backward section). The JVP tangent kernel
+  supports all of it.
 - fp16/bf16 only, head_dim % 8 == 0 (validated with clear errors).
 
 Layout note (from fa4.py): heads and head_dim are baked into the kernel (they
@@ -181,6 +182,14 @@ def _fa4_fwd_lse(stream, tree, mO, mLSE):
 #                   buffer (aliased in place, hence `input_output_aliases`)
 #   postprocess ->  dQaccum -> dQ in the input dtype, scaled by softmax_scale
 #
+# With GQA (qhead_per_kvhead > 1) the kernel cannot write dK/dV directly:
+# every q head sharing a kv head contributes, so it atomically accumulates
+# into fp32 dKaccum/dVaccum laid out like dQaccum (zeroed here with
+# jnp.zeros; the preprocess only zeroes dQaccum) and leaves the softmax scale
+# off dK. The same postprocess kernel then converts both: dK with the scale,
+# dV with scale 1. Its tile is _BWD_TILE_M, which matches the kv tile because
+# _BWD_TILE_M == _BWD_TILE_N.
+#
 # Tile config: upstream has no sm_8x branch for the backward -- arch 8 falls
 # through to the SM100 settings, which ask for 128x128 tiles that will not fit
 # sm_86's 100 KB of SMEM. We use the SM120 config (64x64, 128 threads) on both
@@ -210,13 +219,13 @@ def _bwd_kernel_cls(arch: int):
 
 
 @functools.cache
-def _get_bwd(dtype, head_dim, head_dim_v, causal, local, mask_mod, n_aux, arch):
+def _get_bwd(dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, local, mask_mod, n_aux, arch):
     stages = 2 if head_dim <= 64 else 1
     return _bwd_kernel_cls(arch)(
         dtype,
         head_dim,
         head_dim_v,
-        1,  # qhead_per_kvhead; GQA backward needs a dK/dV accumulator pass
+        qhead_per_kvhead,
         _BWD_TILE_M,
         _BWD_TILE_N,
         stages,  # num_stages_Q
@@ -285,8 +294,36 @@ def _fa4_bwd(stream, tree, mQ, mK, mV, mdO, mLSElog2, mPdPsum, _mdQaccum_in, aux
 
 
 @cute.jit
+def _fa4_bwd_gqa(
+    stream, tree, mQ, mK, mV, mdO, mLSElog2, mPdPsum, _mdQaccum_in, _mdKaccum_in, _mdVaccum_in, aux,
+    mdQaccum, mdKaccum, mdVaccum,
+):
+    """GQA variant: the kernel's dK/dV slots take fp32 accumulators (aliased
+    in place like dQaccum) instead of the final dK/dV."""
+    from fa4_jax.cute.utils import AuxData
+
+    wl, wr = _windows(tree)
+    tree["bwd"](
+        mQ, mK, mV, mdO, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum,
+        cutlass.Float32(tree["scale"]),
+        None, None, None, None,  # cu_seqlens_q/k, seqused_q/k
+        window_size_left=wl,
+        window_size_right=wr,
+        aux_data=AuxData(tensors=aux) if cutlass.const_expr(len(aux) > 0) else AuxData(),
+        stream=stream,
+    )
+
+
+@cute.jit
 def _fa4_bwd_post(stream, tree, mdQaccum, mdQ):
+    """dQaccum -> dQ (or, under GQA, dKaccum -> dK: same head_dim, same scale)."""
     tree["post"](mdQaccum, mdQ, cutlass.Float32(tree["scale"]), None, None, None, stream=stream)
+
+
+@cute.jit
+def _fa4_bwd_post_dv(stream, tree, mdVaccum, mdV):
+    """dVaccum -> dV under GQA: head_dim_v tiles, and no softmax scale."""
+    tree["post_v"](mdVaccum, mdV, cutlass.Float32(1.0), None, None, None, stream=stream)
 
 
 # ---------------------------------------------------------------- jvp tangent
@@ -361,10 +398,13 @@ def _get_static(cfg: AttnConfig, dtype, head_dim, head_dim_v, qhead_per_kvhead, 
         )
     elif kind == "bwd":
         st["bwd"] = _get_bwd(
-            dtype, head_dim, head_dim_v, causal, local, mask_mod, cfg.n_aux, arch
+            dtype, head_dim, head_dim_v, qhead_per_kvhead,
+            causal, local, mask_mod, cfg.n_aux, arch,
         )
         st["pre"] = _get_bwd_pre(dtype, head_dim, head_dim_v)
         st["post"] = _get_bwd_post(dtype, head_dim, arch)
+        if qhead_per_kvhead > 1:
+            st["post_v"] = _get_bwd_post(dtype, head_dim_v, arch)
     elif kind == "jvp":
         st["jvp"] = _get_jvp(
             dtype, head_dim, head_dim_v, qhead_per_kvhead,
@@ -444,12 +484,6 @@ class CuteBackend:
         )
 
     def vjp(self, cfg, q, k, v, out, lse, d_out, d_lse, aux):
-        if q.shape[2] != k.shape[2]:
-            raise NotImplementedError(
-                "fa4 backward does not support GQA (it would need a dK/dV accumulator "
-                "pass this wrapper omits). Repeat the kv heads out to q heads with "
-                "jnp.repeat if you need gradients."
-            )
         if d_lse is not None:
             raise NotImplementedError(
                 "reverse mode through the lse output is not wired to the cute "
@@ -457,12 +491,13 @@ class CuteBackend:
             )
         d_out = d_out.astype(q.dtype)
         b, s_q, h, d = q.shape
+        _, s_kv, h_kv, d_v = v.shape
         s_q_pad = _round_up(s_q, _BWD_TILE_M)
         d_pad = _round_up(d, 32)
         f32 = jnp.float32
-        dtype, hd, hdv, _ = _validate(cfg, q, k, v)
+        dtype, hd, hdv, ratio = _validate(cfg, q, k, v)
         arch = _device_arch()
-        st = _get_static(cfg, dtype, hd, hdv, 1, arch, "bwd")
+        st = _get_static(cfg, dtype, hd, hdv, ratio, arch, "bwd")
 
         dpsum, lse_log2, dq_accum = cutejax.call(
             _fa4_bwd_pre,
@@ -477,19 +512,53 @@ class CuteBackend:
             name="fa4_bwd_pre",
         )
 
-        dq_accum, dk, dv = cutejax.call(
-            _fa4_bwd,
-            [
-                jax.ShapeDtypeStruct(dq_accum.shape, f32),
+        if ratio == 1:
+            dq_accum, dk, dv = cutejax.call(
+                _fa4_bwd,
+                [
+                    jax.ShapeDtypeStruct(dq_accum.shape, f32),
+                    jax.ShapeDtypeStruct(k.shape, k.dtype),
+                    jax.ShapeDtypeStruct(v.shape, v.dtype),
+                ],
+                st, q, k, v, d_out, lse_log2, dpsum, dq_accum, tuple(aux),
+                in_specs=[_QKV_SPEC] * 4 + [_F32_SPEC] * 3 + [None] * len(aux),
+                out_specs=[_F32_SPEC, _QKV_SPEC, _QKV_SPEC],
+                input_output_aliases={6: 0},
+                name="fa4_bwd",
+            )
+        else:
+            s_kv_pad = _round_up(s_kv, _BWD_TILE_N)
+            dk_accum = jnp.zeros((b, h_kv, s_kv_pad * d_pad), f32)
+            dv_accum = jnp.zeros((b, h_kv, s_kv_pad * _round_up(d_v, 32)), f32)
+            dq_accum, dk_accum, dv_accum = cutejax.call(
+                _fa4_bwd_gqa,
+                [
+                    jax.ShapeDtypeStruct(dq_accum.shape, f32),
+                    jax.ShapeDtypeStruct(dk_accum.shape, f32),
+                    jax.ShapeDtypeStruct(dv_accum.shape, f32),
+                ],
+                st, q, k, v, d_out, lse_log2, dpsum, dq_accum, dk_accum, dv_accum, tuple(aux),
+                in_specs=[_QKV_SPEC] * 4 + [_F32_SPEC] * 5 + [None] * len(aux),
+                out_specs=[_F32_SPEC] * 3,
+                input_output_aliases={6: 0, 7: 1, 8: 2},
+                name="fa4_bwd_gqa",
+            )
+            dk = cutejax.call(
+                _fa4_bwd_post,
                 jax.ShapeDtypeStruct(k.shape, k.dtype),
+                st, dk_accum,
+                in_specs=[_F32_SPEC],
+                out_specs=_QKV_SPEC,
+                name="fa4_bwd_post_dk",
+            )
+            dv = cutejax.call(
+                _fa4_bwd_post_dv,
                 jax.ShapeDtypeStruct(v.shape, v.dtype),
-            ],
-            st, q, k, v, d_out, lse_log2, dpsum, dq_accum, tuple(aux),
-            in_specs=[_QKV_SPEC] * 4 + [_F32_SPEC] * 3 + [None] * len(aux),
-            out_specs=[_F32_SPEC, _QKV_SPEC, _QKV_SPEC],
-            input_output_aliases={6: 0},
-            name="fa4_bwd",
-        )
+                st, dv_accum,
+                in_specs=[_F32_SPEC],
+                out_specs=_QKV_SPEC,
+                name="fa4_bwd_post_dv",
+            )
 
         dq = cutejax.call(
             _fa4_bwd_post,
