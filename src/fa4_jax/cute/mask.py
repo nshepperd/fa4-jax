@@ -815,6 +815,25 @@ class AttentionMask:
 
                     mask_r2p_lambda(acc_S, mask_gen_fn, rank1=True)
 
+        # fa4-jax addition: a mask_mod combined with the native causal/local
+        # band (the SM100 mirror of the second pass in apply_mask above). The
+        # band branch has already applied its column limits; the mod pass then
+        # masks further. The AND of the band with a mod can only mask more, so
+        # the kernel's causal/local KV-block skipping stays sound.
+        if const_expr(mask_mod is not None and (mask_causal or mask_local)):
+            if const_expr(vec_size == 1):
+                self.apply_mask_mod_sm100_scalar(
+                    acc_S, tScS_t2r, m_block, n_block,
+                    mask_seqlen, mask_mod, batch_idx, head_idx,
+                    aux_data, fastdiv_mods, head_divmod, check_q_boundary,
+                )
+            else:
+                self.apply_mask_mod_sm100_vector(
+                    acc_S, tScS_t2r, m_block, n_block,
+                    mask_seqlen, mask_mod, batch_idx, head_idx, vec_size,
+                    aux_data, fastdiv_mods, head_divmod, check_q_boundary,
+                )
+
     @cute.jit
     def apply_mask_sm100_transposed(
         self,
@@ -881,51 +900,11 @@ class AttentionMask:
                             acc_S[i] = -cutlass.Float32.inf if out_of_bounds else acc_S[i]
             else:
                 # Partial block
-                has_fastdiv = const_expr(
-                    fastdiv_mods is not None
-                    and fastdiv_mods[0] is not None
-                    and fastdiv_mods[1] is not None
+                self.apply_mask_mod_sm100_transposed(
+                    acc_S, tScS_t2r, ROW, COL, m_block, n_block,
+                    mask_seqlen, mask_mod, batch_idx, head_idx,
+                    aux_data, fastdiv_mods, check_m_boundary,
                 )
-                wrap_aux_indices = const_expr(
-                    has_fastdiv and mask_seqlen and const_expr(aux_data.tensors is not None)
-                )
-                batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32)
-                head_idx_ssa = utils.scalar_to_ssa(head_idx, cutlass.Int32)
-
-                ncol = const_expr(cute.size(tScS_t2r.shape))
-                for i in cutlass.range_constexpr(ncol):
-                    row_coord = tScS_t2r[i][ROW]
-                    col_coord = tScS_t2r[i][COL]
-                    global_q = row_coord + m_block * self.tile_m
-                    global_kv = col_coord + n_block * self.tile_n
-
-                    q_idx_for_mod = global_q
-                    kv_idx_for_mod = global_kv
-                    if const_expr(wrap_aux_indices):
-                        _, q_idx_for_mod = divmod(global_q, fastdiv_mods[0])
-                        _, kv_idx_for_mod = divmod(global_kv, fastdiv_mods[1])
-
-                    q_idx_ssa = utils.scalar_to_ssa(q_idx_for_mod, cutlass.Int32)
-                    kv_idx_ssa = utils.scalar_to_ssa(kv_idx_for_mod, cutlass.Int32)
-
-                    mask_value = call_mask_mod(
-                        mask_mod,
-                        batch_idx_ssa,
-                        head_idx_ssa,
-                        q_idx_ssa,
-                        kv_idx_ssa,
-                        self.seqlen_info,
-                        aux_data,
-                    )
-                    cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
-                    acc_S[i] = acc_S[i] if cond else -cutlass.Float32.inf
-
-                    if const_expr(mask_seqlen):
-                        # check_m_boundary=False skips q check for non-boundary m_blocks
-                        q_out_of_bounds = check_m_boundary and (global_q >= self.seqlen_q)
-                        kv_out_of_bounds = global_kv >= self.seqlen_k
-                        out_of_bounds = q_out_of_bounds or kv_out_of_bounds
-                        acc_S[i] = -cutlass.Float32.inf if out_of_bounds else acc_S[i]
 
         elif const_expr(not mask_causal and not mask_local):
             if const_expr(mask_seqlen):
@@ -999,6 +978,86 @@ class AttentionMask:
                         mask_gen_fn,
                         rank1=True,
                     )
+
+        # fa4-jax addition: a mask_mod combined with the native causal/local
+        # band, backward flavor (mirrors apply_mask's second pass). The band
+        # branch above has applied its row limits; the mod masks further over
+        # the visited tiles, so the kernel's m-block range skipping stays
+        # sound. Full blocks (block sparsity) are by definition all-visible
+        # under the mod, so only partial blocks run it.
+        if const_expr(mask_mod is not None and (mask_causal or mask_local)):
+            if not is_full_block:
+                self.apply_mask_mod_sm100_transposed(
+                    acc_S, tScS_t2r, ROW, COL, m_block, n_block,
+                    mask_seqlen, mask_mod, batch_idx, head_idx,
+                    aux_data, fastdiv_mods, check_m_boundary,
+                )
+
+    @cute.jit
+    def apply_mask_mod_sm100_transposed(
+        self,
+        acc_S: cute.Tensor,
+        tScS_t2r: cute.Tensor,
+        ROW: cutlass.Constexpr[int],
+        COL: cutlass.Constexpr[int],
+        m_block: cutlass.Int32,
+        n_block: cutlass.Int32,
+        mask_seqlen: cutlass.Constexpr[bool],
+        mask_mod: cutlass.Constexpr[Callable],
+        batch_idx: Int32,
+        head_idx: Int32,
+        aux_data: AuxData,
+        fastdiv_mods=(None, None),
+        check_m_boundary: bool = True,
+    ) -> None:
+        """The FlexAttention mask_mod element loop of the SM100 backward
+        (extracted so the causal/local branch can run it as a second pass;
+        fa4-jax refactor of upstream's inline partial-block loop)."""
+        has_fastdiv = const_expr(
+            fastdiv_mods is not None
+            and fastdiv_mods[0] is not None
+            and fastdiv_mods[1] is not None
+        )
+        wrap_aux_indices = const_expr(
+            has_fastdiv and mask_seqlen and const_expr(aux_data.tensors is not None)
+        )
+        batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32)
+        head_idx_ssa = utils.scalar_to_ssa(head_idx, cutlass.Int32)
+
+        ncol = const_expr(cute.size(tScS_t2r.shape))
+        for i in cutlass.range_constexpr(ncol):
+            row_coord = tScS_t2r[i][ROW]
+            col_coord = tScS_t2r[i][COL]
+            global_q = row_coord + m_block * self.tile_m
+            global_kv = col_coord + n_block * self.tile_n
+
+            q_idx_for_mod = global_q
+            kv_idx_for_mod = global_kv
+            if const_expr(wrap_aux_indices):
+                _, q_idx_for_mod = divmod(global_q, fastdiv_mods[0])
+                _, kv_idx_for_mod = divmod(global_kv, fastdiv_mods[1])
+
+            q_idx_ssa = utils.scalar_to_ssa(q_idx_for_mod, cutlass.Int32)
+            kv_idx_ssa = utils.scalar_to_ssa(kv_idx_for_mod, cutlass.Int32)
+
+            mask_value = call_mask_mod(
+                mask_mod,
+                batch_idx_ssa,
+                head_idx_ssa,
+                q_idx_ssa,
+                kv_idx_ssa,
+                self.seqlen_info,
+                aux_data,
+            )
+            cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
+            acc_S[i] = acc_S[i] if cond else -cutlass.Float32.inf
+
+            if const_expr(mask_seqlen):
+                # check_m_boundary=False skips q check for non-boundary m_blocks
+                q_out_of_bounds = check_m_boundary and (global_q >= self.seqlen_q)
+                kv_out_of_bounds = global_kv >= self.seqlen_k
+                out_of_bounds = q_out_of_bounds or kv_out_of_bounds
+                acc_S[i] = -cutlass.Float32.inf if out_of_bounds else acc_S[i]
 
 
 # -----------------------------------------------------------------------------

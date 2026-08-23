@@ -7,9 +7,14 @@ the copy installed in minimax-music3's venv, which already carried the
 blocks left of the sliding window instead of masking them; upstream marks the
 gap with a bare `# TODO: local`).
 
-Only the SM80/SM120 (Ampere / consumer-Blackwell) forward+backward closure is
-vendored — not the SM90/SM100 kernels, the torch `interface.py`, or the
-varlen/paged serving extras beyond what the closure drags in.
+The SM80/SM120 (Ampere / consumer-Blackwell) and SM100 (datacenter
+Blackwell: `flash_fwd_sm100.py`, `flash_bwd_sm100.py` and the helpers they
+drag in — `blackwell_helpers.py`, `mma_sm100_desc.py`, `barrier.py`,
+`copy_utils.py`, `fa_logging.py`) forward+backward closures are vendored —
+not the SM90 kernels, the SM100 MLA/hd256-2CTA variants, the torch
+`interface.py`, or the varlen/paged serving extras beyond what the closures
+drag in. The SM100 files were taken from the same 4.0.0b26 wheel
+(re-downloaded from PyPI) with only the import rewrite applied.
 
 ## Local changes
 
@@ -22,7 +27,17 @@ varlen/paged serving extras beyond what the closure drags in.
   (module not vendored).
 - `flash_jvp.py`: **new file, not upstream** — forward-mode (JVP) tangent
   kernel, written for fa4-jax in the style of `flash_bwd.py`'s recompute
-  pass. See its docstring for the math.
+  pass. See its docstring for the math. SM80-style (cp.async + mma.sync),
+  but those instructions exist on every supported arch, so the same kernel
+  also serves sm_100/sm_120.
+- `flash_bwd.py` (SM80/SM120 backward): mask_mod + aux tensors added
+  (upstream's SM100 backward already has them).
+- `mask.py`: the FlexAttention mask_mod element loops extracted into methods
+  (`apply_mask_mod_sm80`, `apply_mask_mod_sm100_transposed`), and every
+  `apply_mask*` entry point runs the mod as a second masking pass when it is
+  combined with the native causal/local band — upstream's branch structure
+  would silently drop the mod in that combination. The band's KV-block
+  skipping is unaffected: ANDing a mod onto the band can only mask more.
 
 ## Updating
 

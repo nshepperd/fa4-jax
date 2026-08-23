@@ -1,7 +1,8 @@
 # fa4-jax
 
 FlashAttention-4 (Tri Dao's CuTe DSL kernels) as a JAX library, for the
-SM80/SM120 family (Ampere → consumer Blackwell), built on
+SM80/SM120 family (Ampere → consumer Blackwell) and SM100 (datacenter
+Blackwell: B200/GB200, via the tcgen05 kernels), built on
 [cutejax](../cutejax).
 
 What it provides over `jax.nn.dot_product_attention`:
@@ -54,11 +55,15 @@ decode / chunked prefill just works). Mask mods see raw indices, so
 lengths match.
 
 Restrictions (kernel-side, all checked with clear errors): fp16/bf16, head_dim
-a multiple of 8 and ≤ 128 (the SM80/SM120 tile budget), no cotangent through
-`lse` in reverse mode. GQA works in all
-three passes (the backward accumulates dK/dV in fp32 across the q heads of
-each kv head). Mask mods work in all three passes — the backward's mask_mod
-support is a local addition to the vendored kernel. Combining
+a multiple of 8 and ≤ 128 (the SM80/SM120 tile budget; on sm_100, larger heads
+would need 2-CTA MMAs, i.e. cluster launches, which this wrapper doesn't do),
+no cotangent through `lse` in reverse mode. GQA works in all three passes (the
+backward accumulates dK/dV in fp32 across the q heads of each kv head). On
+sm_100 the backward runs the tcgen05 kernel for equal head dims and falls back
+to the SM80-MMA kernel for mixed ones (which miscompile in upstream b26). Mask
+mods work in all three passes — the SM80/SM120 backward's mask_mod support is
+a local addition to the vendored kernel (the SM100 one has it upstream).
+Combining
 causal/window_size with a mask_mod keeps the native band's KV-block skipping
 and runs the mod as a second masking pass over the visited tiles (also a
 local mask.py change; upstream's branch structure silently drops the mod in

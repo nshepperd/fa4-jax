@@ -2,8 +2,8 @@
 kernel) against the plain-jnp reference backend, for values, gradients and
 JVPs.
 
-Needs a CUDA device (sm_80+ family; sm_86/sm_120 are what this repo
-targets). Kernel compiles are cached per (head config, mask treedef), so the
+Needs a CUDA device (sm_86/sm_120 and sm_100 are what this repo targets).
+Kernel compiles are cached per (head config, mask treedef), so the
 parametrized sweeps mostly reuse a handful of compiles.
 """
 
