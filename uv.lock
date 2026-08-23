@@ -11,6 +11,9 @@ resolution-markers = [
 exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
 exclude-newer-span = "P7D"
 
+[options.exclude-newer-package]
+cutejax = "2100-01-01T13:00:00Z"
+
 [manifest]
 overrides = [{ name = "nvidia-cutlass-dsl", specifier = ">=4.7" }]
 
@@ -168,29 +171,15 @@ nvtx = [
 [[package]]
 name = "cutejax"
 version = "0.1.0"
-source = { editable = "../cutejax" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jax" },
     { name = "jax-tvm-ffi" },
     { name = "nvidia-cutlass-dsl" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "jax" },
-    { name = "jax-tvm-ffi" },
-    { name = "nvidia-cutlass-dsl" },
-    { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "extra == 'cu13'", specifier = ">=4.7.0" },
-]
-provides-extras = ["cu13"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "equinox" },
-    { name = "hypothesis", specifier = ">=6.161.2" },
-    { name = "jax", extras = ["cuda13"] },
-    { name = "nvidia-cutlass-dsl", extras = ["cu13"] },
-    { name = "pytest", specifier = ">=9.1.1" },
+sdist = { url = "https://files.pythonhosted.org/packages/e4/7e/b8e7c9429364ae1df61df1d4ea8330e2e603d13ada7d41379826972007b9/cutejax-0.1.0.tar.gz", hash = "sha256:f263626da8e9bce80ac12c3ee6774f1ab8400f3148d183e6e19ffa7e7772075d", size = 91082, upload-time = "2026-08-23T01:38:58.18Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0d/41/d73bdb5c08332e91d9d50542925b2489428ad728b37e775350ea9bfb5d2a/cutejax-0.1.0-py3-none-any.whl", hash = "sha256:f9e5a756d14854a2f514872fa6fb39850ea3930f4ba8d440713b4c4829e3e1ba", size = 17788, upload-time = "2026-08-23T01:38:56.842Z" },
 ]
 
 [[package]]
@@ -227,7 +216,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cutejax", editable = "../cutejax" },
+    { name = "cutejax" },
     { name = "jax", specifier = ">=0.8.0" },
     { name = "jax", extras = ["cuda13"], marker = "extra == 'cu13'" },
     { name = "jaxtyping" },

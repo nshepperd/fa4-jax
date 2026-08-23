@@ -19,13 +19,12 @@ dependencies = [
 # installs (reference backend, unit tests) don't need either.
 cu13 = ["jax[cuda13]", "nvidia-cutlass-dsl[cu13]>=4.7.0"]
 
-[tool.uv.sources]
-cutejax = { path = "../cutejax", editable = true }
-
 [tool.uv]
 # flash-attn-4's cutlass pin doesn't apply here (we vendor the kernels), but
 # quack-kernels may pin an older cutlass-dsl; the kernels run fine on 4.7+.
 override-dependencies = ["nvidia-cutlass-dsl>=4.7"]
+# cutejax is our own package; exempt it from the global exclude-newer release-age rule.
+exclude-newer-package = { cutejax = "2100-01-01" }
 
 [dependency-groups]
 dev = [
