@@ -463,8 +463,13 @@ class FlashAttentionBackwardSm80:
         # then discards those entries). Tensors here are still
         # (batch, seqlen, head, dim), unlike the forward's transposed view,
         # so utils.compute_fastdiv_mods (which reads shape[0]) doesn't apply.
+        # Varlen tensors are packed (total, head, dim): the token axis is
+        # dim 0 there (wrapping by shape[1] would wrap indices modulo the
+        # head count and feed the mask_mod garbage coordinates).
         if cutlass.const_expr(self.mask_mod is not None and aux_data.tensors is not None):
-            fastdiv_mods = (FastDivmodDivisor(mQ.shape[1]), FastDivmodDivisor(mK.shape[1]))
+            seqlen_q_div = mQ.shape[0] if cutlass.const_expr(mCuSeqlensQ is not None) else mQ.shape[1]
+            seqlen_k_div = mK.shape[0] if cutlass.const_expr(mCuSeqlensK is not None) else mK.shape[1]
+            fastdiv_mods = (FastDivmodDivisor(seqlen_q_div), FastDivmodDivisor(seqlen_k_div))
         else:
             fastdiv_mods = None
         self.kernel(

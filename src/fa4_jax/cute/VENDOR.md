@@ -24,7 +24,25 @@ drag in. The SM100 files were taken from the same 4.0.0b26 wheel
   calls. `from __future__ import annotations` added where torch types appear
   in annotations.
 - `flash_fwd.py`: the lazy `FlashAttentionForwardSm90` re-export removed
-  (module not vendored).
+  (module not vendored). Also the kernel body is guarded on
+  `work_tile.is_valid_tile` (as upstream's backward kernels already are):
+  the varlen scheduler's grid is an upper bound and its wasted tiles decode
+  to `batch_idx == num_batch`, for which `SeqlenInfoQK` reads
+  `cu_seqlens[num_batch + 1]` / `seqused[num_batch]` one element out of
+  bounds and then acts on garbage seqlens — observed as illegal-address
+  faults from the derived JVP kernel; upstream's comment claims those tiles
+  see zero seqlens, but nothing enforces it. The epilogue's smem O tile is
+  staged at the *base* of the shared-memory struct instead of at `sQ`
+  (upstream): sO is `(tile_m, head_dim_v)` while sQ holds
+  `(tile_m, head_dim)`, so `head_dim_v > head_dim` overflowed into sK and —
+  beyond ~1.5x — past the allocation entirely (smem OOB,
+  `CUDA_ERROR_ILLEGAL_ADDRESS`); `can_implement` now also bounds the O tile
+  by the struct size. And `use_tma_O` is pinned False:
+  upstream enables it for sm_90..<sm_120 *devices*, but this kernel never
+  builds a TMA atom for O (the epilogue gets `tma_atom_O=None`) — the flag
+  only made sense for the unvendored Sm90 subclass, and it misfires whenever
+  this family runs on an sm_100 device (kernel_arch override, or by analogy
+  with the backward's mixed-head-dims fallback).
 - `flash_jvp.py`: **new file, not upstream** — forward-mode (JVP) tangent
   kernel, written for fa4-jax in the style of `flash_bwd.py`'s recompute
   pass. See its docstring for the math. SM80-style (cp.async + mma.sync),
