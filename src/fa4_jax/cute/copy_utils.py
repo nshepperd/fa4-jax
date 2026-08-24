@@ -13,6 +13,84 @@ from cutlass._mlir.dialects import llvm
 import cutlass.pipeline
 
 
+# ------------------------------------------------------------------ ragged TMA
+#
+# Varlen zero-fill trick (see quack.copy_utils.create_ragged_tensor_for_tma
+# for the address math): widen the seqlen mode to a huge extent and add two
+# wraparound modes whose combined address contribution cancels mod 2^64, so a
+# per-sequence offset_ragged_tensor maps rows [0, seqlen) onto the tail of the
+# extent — rows >= seqlen are descriptor-OOB and TMA loads zero-fill them.
+#
+# quack's version builds the added modes as static ints; with the compile-time
+# head dims fa4-jax uses, the layout's static size/cosize products overflow the
+# DSL's int64 layout arithmetic and make_tensor aborts (std::bad_variant_access).
+# This version materializes the added extents and the wraparound stride as
+# runtime values, so nothing is folded statically. Runtime cost: none on
+# device; the TMA descriptor already reads its extents at encode time.
+
+RAGGED_BIG_INT = 1 << 30
+_RAGGED_MAX_INT = (1 << 31) - 1
+_RAGGED_BIG_INT_INV = (1 << 64) // RAGGED_BIG_INT
+
+
+@dsl_user_op
+def create_ragged_tensor_for_tma(
+    mX: cute.Tensor, ragged_dim: int = 0, *, loc=None, ip=None
+) -> cute.Tensor:
+    """Wrap a (rank <= 3) gmem tensor for seqlen-bounded TMA loads.
+
+    Pair with :func:`offset_ragged_tensor` per sequence in the kernel. Only
+    the load (non-ptr_shift) flavor is provided; stores go through quack's.
+    """
+    rank = cute.rank(mX)
+    assert rank <= 3, "ragged TMA load tensor supports up to 3 dimensions"
+    if ragged_dim < 0:
+        ragged_dim += rank
+    stride_r = mX.stride[ragged_dim]
+    big = Int32(RAGGED_BIG_INT).ir_value(loc=loc, ip=ip)
+    cap = Int32(_RAGGED_MAX_INT).ir_value(loc=loc, ip=ip)
+    # stride_r is compile-time for fa4-jax's static head dims; the subtraction
+    # must not fold back into a static (> int32) stride, hence Int64+ir_value.
+    wrap_stride = (cutlass.Int64(_RAGGED_BIG_INT_INV) - stride_r).ir_value(loc=loc, ip=ip)
+    new_shape = mX.shape[:ragged_dim] + (big,) + mX.shape[ragged_dim + 1 :] + (cap, cap)
+    new_stride = (
+        mX.stride[:ragged_dim]
+        + (stride_r,)
+        + mX.stride[ragged_dim + 1 :]
+        + (wrap_stride, stride_r)
+    )
+    return cute.make_tensor(
+        mX.iterator, cute.make_layout(new_shape, stride=new_stride, loc=loc, ip=ip), loc=loc, ip=ip
+    )
+
+
+@dsl_user_op
+def offset_ragged_tensor(
+    mX: cute.Tensor,
+    offset: Int32,
+    length: Int32,
+    ragged_dim: int = 0,
+    *,
+    loc=None,
+    ip=None,
+) -> cute.Tensor:
+    """Slice one sequence out of a :func:`create_ragged_tensor_for_tma` tensor.
+
+    Rows [0, length) map to gmem [offset, offset + length); rows >= length map
+    past the wraparound extent and zero-fill on TMA load. The two trailing
+    wraparound modes are consumed here, restoring the original rank.
+    """
+    rank = cute.rank(mX)
+    if ragged_dim < 0:
+        ragged_dim += rank
+    assert rank >= ragged_dim + 3
+    big_int = RAGGED_BIG_INT
+    offset_val = big_int - length
+    offset_tuple = (None,) * ragged_dim + (offset_val,) + (None,) * (rank - ragged_dim - 3)
+    index_tuple = (None,) * (rank - 2) + (big_int, offset + length)
+    return cute.domain_offset(offset_tuple, mX[index_tuple], loc=loc, ip=ip)
+
+
 @dsl_user_op
 def cvt_copy(
     atom: cute.CopyAtom,

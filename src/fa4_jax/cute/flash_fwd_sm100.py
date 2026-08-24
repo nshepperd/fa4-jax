@@ -33,6 +33,8 @@ from cutlass.cutlass_dsl import BaseDSL
 
 from quack import copy_utils, layout_utils
 
+from fa4_jax.cute.copy_utils import create_ragged_tensor_for_tma, offset_ragged_tensor
+
 from fa4_jax.cute.paged_kv import PagedKVManager
 from fa4_jax.cute.cute_dsl_utils import assume_tensor_aligned
 from fa4_jax.cute import utils
@@ -651,7 +653,18 @@ class FlashAttentionForwardSm100:
 
         tma_atom_K = None
         tma_atom_V = None
+        # The ragged wrap below changes mK.shape[0] to the wraparound extent;
+        # scheduler args and fastdiv mods need the real one.
+        mK_orig = mK
         if const_expr(self.use_tma_KV):
+            # Varlen: rag the seqlen mode (2-extra-dim wraparound; TMA loads
+            # can't ptr_shift) so rows past seqused_k land outside the
+            # descriptor and zero-fill. Without this the boundary tile loads
+            # the slot's dead padding verbatim, and NaN there reaches the PV
+            # MMA as 0*NaN even though the scores are masked.
+            if const_expr(mCuSeqlensK is not None and mPageTable is None):
+                mK = create_ragged_tensor_for_tma(mK, ragged_dim=0)
+                mV = create_ragged_tensor_for_tma(mV, ragged_dim=1)
             # TMA load for K
             tma_atom_K, mK = cute.nvgpu.make_tiled_tma_atom_B(
                 tma_load_op,
@@ -709,9 +722,9 @@ class FlashAttentionForwardSm100:
             if const_expr(mCuSeqlensQ is None)
             else cute.size(mCuSeqlensQ.shape[0] - 1),
             num_splits,
-            cute.size(mK.shape[0])
+            cute.size(mK_orig.shape[0])
             if const_expr(mPageTable is None)
-            else mK.shape[0] * mPageTable.shape[1],
+            else mK_orig.shape[0] * mPageTable.shape[1],
             mQ.shape[1],
             mV.shape[0],  # Note that this is different from Sm90 since we transpose mV in Sm100
             total_q=cute.size(mQ.shape[0])
@@ -797,7 +810,7 @@ class FlashAttentionForwardSm100:
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
         window_size_left = Int32(window_size_left) if window_size_left is not None else None
         window_size_right = Int32(window_size_right) if window_size_right is not None else None
-        fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors, mPageTable)
+        fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK_orig, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors, mPageTable)
 
         head_divmod = None
         if cutlass.const_expr(self.pack_gqa):
@@ -1504,6 +1517,18 @@ class FlashAttentionForwardSm100:
             if const_expr(mPageTable is None):
                 if const_expr(not seqlen.has_cu_seqlens_k):
                     mK_cur, mV_cur = [t[None, None, head_idx_kv, batch_idx] for t in (mK, mV)]
+                elif const_expr(self.use_tma_KV):
+                    # mK/mV were ragged-wrapped at TMA-atom creation: rows of
+                    # this sequence map to the tail of the wraparound extent,
+                    # so rows >= seqlen_k are descriptor-OOB and zero-fill.
+                    mK_cur = offset_ragged_tensor(
+                        mK[None, None, head_idx_kv, None, None],
+                        seqlen.offset_k, seqlen.seqlen_k, ragged_dim=0,
+                    )
+                    mV_cur = offset_ragged_tensor(
+                        mV[None, None, head_idx_kv, None, None],
+                        seqlen.offset_k, seqlen.seqlen_k, ragged_dim=1,
+                    )
                 else:
                     mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, head_idx_kv])
                     mV_cur = cute.domain_offset((0, seqlen.offset_k), mV[None, None, head_idx_kv])
@@ -1621,9 +1646,13 @@ class FlashAttentionForwardSm100:
                     )
                     if const_expr(not self.use_tma_KV):
                         paged_kv_manager.load_page_table(n_block_first)
+                    # n_block_first, not n_block_max - 1: seqused_k == 0 gives
+                    # n_block_max == 0, and block -1 would read the previous
+                    # slot's tail (its dead padding included). Block 0 is all
+                    # rows >= seqlen_k: descriptor-OOB for the ragged varlen
+                    # path, and fully masked either way.
                     if issue_kv_for_this_warp:
-                        load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # K0
-                    # load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx, extra_tx_count=self.tma_copy_bytes["Q"])  # K0
+                        load_K(block=n_block_first, producer_state=kv_producer_state, page_idx=page_idx)  # K0
                     if issue_q_for_this_warp:
                         load_Q(block=0, stage=0)
                     if issue_kv_for_this_warp:
@@ -1632,7 +1661,7 @@ class FlashAttentionForwardSm100:
                         load_Q(block=1, stage=1)
                     q_producer_phase ^= 1
                     if issue_kv_for_this_warp:
-                        load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # V0
+                        load_V(block=n_block_first, producer_state=kv_producer_state, page_idx=page_idx)  # V0
                         kv_producer_state.advance()
                     for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                         n_block = n_block_max - 2 - i

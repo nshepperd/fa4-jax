@@ -606,10 +606,29 @@ class FlashAttentionBackwardSm100:
             )
 
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
+        # Varlen: rag the seqlen mode (copy_utils.create_ragged_tensor_for_tma)
+        # so rows past seqused land outside the TMA descriptor and zero-fill.
+        # Without this the boundary tiles load the slots' dead padding
+        # verbatim, and NaN there reaches dK/dV/dQ as 0*NaN inside the MMAs
+        # (dK = dS^T @ Q and dQ = dS @ K multiply against the raw operands, so
+        # score masking alone cannot contain it). The 2-CTA Qt/Kt/dOt atoms
+        # below are left unragged: that path is unused by fa4-jax.
+        mK_tma_in = mK if const_expr(mCuSeqlensK is None) else (
+            copy_utils.create_ragged_tensor_for_tma(mK, ragged_dim=0)
+        )
+        mV_tma_in = mV if const_expr(mCuSeqlensK is None) else (
+            copy_utils.create_ragged_tensor_for_tma(mV, ragged_dim=0)
+        )
+        mQ_tma_in = mQ if const_expr(mCuSeqlensQ is None) else (
+            copy_utils.create_ragged_tensor_for_tma(mQ, ragged_dim=0)
+        )
+        mdO_tma_in = mdO if const_expr(mCuSeqlensQ is None) else (
+            copy_utils.create_ragged_tensor_for_tma(mdO, ragged_dim=1)
+        )
         # S.T = K @ Q.T
         tma_atom_K, tma_tensor_K = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
-            mK,
+            mK_tma_in,
             cute.select(self.sK_layout, mode=[0, 1, 2]),
             self.mma_tiler_kq,
             self.tiled_mma_S,
@@ -620,7 +639,7 @@ class FlashAttentionBackwardSm100:
         )
         tma_atom_Q, tma_tensor_Q = cute.nvgpu.make_tiled_tma_atom_B(
             Q_tma_op,
-            mQ,
+            mQ_tma_in,
             cute.select(self.sQ_layout, mode=[0, 1, 2]),
             self.mma_tiler_kq,
             self.tiled_mma_S,
@@ -629,7 +648,7 @@ class FlashAttentionBackwardSm100:
         # dP.T = V @ dO.T
         tma_atom_V, tma_tensor_V = cute.nvgpu.make_tiled_tma_atom_A(
             tma_load_op,
-            mV,
+            mV_tma_in,
             cute.select(self.sV_layout, mode=[0, 1, 2]),
             self.mma_tiler_vdo,
             self.tiled_mma_dP,
@@ -641,7 +660,7 @@ class FlashAttentionBackwardSm100:
         )
         tma_atom_dO, tma_tensor_dO = cute.nvgpu.make_tiled_tma_atom_B(
             dO_tma_op,
-            mdO,
+            mdO_tma_in,
             cute.select(self.sdO_layout, mode=[0, 1, 2]),
             self.mma_tiler_pdo,
             self.tiled_mma_dV,
@@ -1777,14 +1796,34 @@ class FlashAttentionBackwardSm100:
             n_block_cta_group = n_block // self.cta_group_size
             n_block_sparse = n_block // self.kv_subtile_factor
 
-            # GMEM tensors (varlen-aware)
-            mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
-            mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
-            mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
+            # GMEM tensors (varlen-aware). The varlen tensors were
+            # ragged-wrapped at TMA-atom creation: rows of this sequence map
+            # to the tail of the wraparound extent, so rows >= seqused are
+            # descriptor-OOB and zero-fill instead of loading dead padding.
             if const_expr(not seqlen.has_cu_seqlens_q):
+                mQ_cur = mQ[None, None, head_idx, batch_idx]
                 mdO_cur = mdO[None, None, head_idx, batch_idx]
             else:
-                mdO_cur = cute.domain_offset((0, seqlen.offset_q), mdO[None, None, head_idx])
+                mQ_cur = copy_utils.offset_ragged_tensor(
+                    mQ[None, None, head_idx, None, None],
+                    seqlen.offset_q, seqlen.seqlen_q, ragged_dim=0,
+                )
+                mdO_cur = copy_utils.offset_ragged_tensor(
+                    mdO[None, None, head_idx, None, None],
+                    seqlen.offset_q, seqlen.seqlen_q, ragged_dim=1,
+                )
+            if const_expr(not seqlen.has_cu_seqlens_k):
+                mK_cur = mK[None, None, head_idx_kv, batch_idx]
+                mV_cur = mV[None, None, head_idx_kv, batch_idx]
+            else:
+                mK_cur = copy_utils.offset_ragged_tensor(
+                    mK[None, None, head_idx_kv, None, None],
+                    seqlen.offset_k, seqlen.seqlen_k, ragged_dim=0,
+                )
+                mV_cur = copy_utils.offset_ragged_tensor(
+                    mV[None, None, head_idx_kv, None, None],
+                    seqlen.offset_k, seqlen.seqlen_k, ragged_dim=0,
+                )
             mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2, padded=True)[None, head_idx]
             mdPsum_cur = seqlen.offset_batch_Q(mdPsum, batch_idx, dim=2, padded=True)[
                 None, head_idx

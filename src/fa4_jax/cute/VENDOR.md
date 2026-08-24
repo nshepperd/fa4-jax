@@ -62,6 +62,25 @@ drag in. The SM100 files were taken from the same 4.0.0b26 wheel
   would silently drop the mod in that combination. The band's KV-block
   skipping is unaffected: ANDing a mod onto the band can only mask more.
 
+- `flash_fwd_sm100.py`, `flash_bwd_sm100.py`: varlen TMA loads clamped to
+  ``seqused`` via ragged descriptors (upstream loads the full boundary tile,
+  so NaN/Inf in the dead padding of a partially-used slot poisons used rows:
+  V through the PV MMA's ``0*NaN`` in the forward, Q/K/V through the bwd
+  MMAs — score masking cannot contain the ``dK = dS^T Q`` / ``dQ = dS K``
+  operand paths). K/V (fwd) and Q/K/V/dO (bwd) are wrapped with
+  ``copy_utils.create_ragged_tensor_for_tma`` + per-sequence
+  ``offset_ragged_tensor`` so rows past ``seqused`` are descriptor-OOB and
+  zero-fill in hardware. The local ``copy_utils`` versions are used, not
+  quack's: quack's builds the wraparound extents/strides as static ints,
+  which overflows the DSL's static layout arithmetic
+  (``std::bad_variant_access``) whenever the head dims are compile-time —
+  ours materializes them as runtime values. The fwd prologue also clamps its
+  first K/V load to block 0 (upstream loads block ``n_block_max - 1 = -1``
+  when ``seqused_k == 0``, reading the previous slot's tail). The 2-CTA
+  Qt/Kt/dOt paths (unused here) are left raw. The SM80/SM120 family needs
+  none of this: its cp.async loads already fold the row predicate in, and a
+  false predicate zero-fills.
+
 ## Updating
 
 Diff against `flash_attn/cute/` of a newer flash-attn-4 wheel, re-apply the

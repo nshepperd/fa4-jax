@@ -439,10 +439,8 @@ def _fa4_bwd_pre_varlen(stream, tree, mO, mdO, mLSE, cu_q, su_q, mPdPsum, mLSElo
     )
 
 
-@cute.jit
-def _fa4_bwd_varlen(
-    stream, tree, mQ, mK, mV, mdO, mLSElog2, mPdPsum, _mdQaccum_in,
-    cu_q, cu_k, su_q, su_k, aux,
+def _bwd_varlen_body(
+    stream, tree, mQ, mK, mV, mdO, mLSElog2, mPdPsum, cu_q, cu_k, su_q, su_k, aux,
     mdQaccum, mdK, mdV,
 ):
     from fa4_jax.cute.utils import AuxData
@@ -456,6 +454,32 @@ def _fa4_bwd_varlen(
         window_size_right=wr,
         aux_data=AuxData(tensors=aux) if cutlass.const_expr(len(aux) > 0) else AuxData(),
         stream=stream,
+    )
+
+
+@cute.jit
+def _fa4_bwd_varlen(
+    stream, tree, mQ, mK, mV, mdO, mLSElog2, mPdPsum, _mdQaccum_in,
+    cu_q, cu_k, su_q, su_k, aux,
+    mdQaccum, mdK, mdV,
+):
+    _bwd_varlen_body(
+        stream, tree, mQ, mK, mV, mdO, mLSElog2, mPdPsum,
+        cu_q, cu_k, su_q, su_k, aux, mdQaccum, mdK, mdV,
+    )
+
+
+@cute.jit
+def _fa4_bwd_varlen_dp(
+    stream, tree, mQ, mK, mV, mdO, mLSElog2, mPdPsum, _mdQaccum_in, _mdK_in, _mdV_in,
+    cu_q, cu_k, su_q, su_k, aux,
+    mdQaccum, mdK, mdV,
+):
+    """defined_padding variant: dK/dV arrive zero-filled and donated, so the
+    kernel's row-predicated stores leave unused rows at exactly 0."""
+    _bwd_varlen_body(
+        stream, tree, mQ, mK, mV, mdO, mLSElog2, mPdPsum,
+        cu_q, cu_k, su_q, su_k, aux, mdQaccum, mdK, mdV,
     )
 
 
@@ -486,7 +510,18 @@ def _fa4_bwd_post_varlen(stream, tree, mdAccum, cu, su, mdX):
 
 
 @cute.jit
+def _fa4_bwd_post_varlen_dp(stream, tree, mdAccum, cu, su, _mdX_in, mdX):
+    """defined_padding variant: mdX arrives zero-filled and donated."""
+    tree["post"](mdAccum, mdX, cutlass.Float32(tree["scale"]), cu, su, None, stream=stream)
+
+
+@cute.jit
 def _fa4_bwd_post_dv_varlen(stream, tree, mdVaccum, cu_k, su_k, mdV):
+    tree["post_v"](mdVaccum, mdV, cutlass.Float32(1.0), cu_k, su_k, None, stream=stream)
+
+
+@cute.jit
+def _fa4_bwd_post_dv_varlen_dp(stream, tree, mdVaccum, cu_k, su_k, _mdV_in, mdV):
     tree["post_v"](mdVaccum, mdV, cutlass.Float32(1.0), cu_k, su_k, None, stream=stream)
 
 
@@ -674,6 +709,13 @@ class CuteBackend:
         return [specs.get(name) for name in sorted(tree) if _is_dynamic(tree[name])]
 
     @staticmethod
+    def _tree_aliases(tree, **outs):
+        """input_output_aliases for named tree entries, resolved against the
+        same sorted-key array-leaf order ``_in_specs`` uses."""
+        order = [name for name in sorted(tree) if _is_dynamic(tree[name])]
+        return {order.index(name): out_idx for name, out_idx in outs.items()}
+
+    @staticmethod
     def _out_struct(q, v):
         return jax.ShapeDtypeStruct((*q.shape[:-1], v.shape[-1]), q.dtype)
 
@@ -687,24 +729,42 @@ class CuteBackend:
 
     def fwd(self, cfg, q, k, v, aux, seqlens=None):
         tree, specs = self._tree(cfg, "fwd", q, k, v, aux, seqlens)
+        aliases = None
+        if cfg.defined_padding and seqlens is not None:
+            # Donate a zero-filled output: the kernel's stores are
+            # row-predicated on the used lengths, so unused rows keep the 0.
+            out_struct = self._out_struct(q, v)
+            tree["out0"] = jnp.zeros(out_struct.shape, out_struct.dtype)
+            specs["out0"] = specs["q"]
+            aliases = self._tree_aliases(tree, out0=0)
         return cutejax.call(
             _fa4_fwd,
             self._out_struct(q, v),
             tree,
             in_specs=self._in_specs(tree, specs),
             out_specs=specs["q"],
-            name="fa4_fwd",
+            input_output_aliases=aliases,
+            name="fa4_fwd" if aliases is None else "fa4_fwd_dp",
         )
 
     def fwd_lse(self, cfg, q, k, v, aux, seqlens=None):
         tree, specs = self._tree(cfg, "fwd", q, k, v, aux, seqlens)
+        aliases = None
+        if cfg.defined_padding and seqlens is not None:
+            out_struct = self._out_struct(q, v)
+            lse_struct = self._lse_struct(q, seqlens)
+            tree["out0"] = jnp.zeros(out_struct.shape, out_struct.dtype)
+            tree["lse0"] = jnp.full(lse_struct.shape, -jnp.inf, lse_struct.dtype)
+            specs.update(out0=specs["q"], lse0=_LSE_SPEC)
+            aliases = self._tree_aliases(tree, out0=0, lse0=1)
         return cutejax.call(
             _fa4_fwd_lse,
             [self._out_struct(q, v), self._lse_struct(q, seqlens)],
             tree,
             in_specs=self._in_specs(tree, specs),
             out_specs=[specs["q"], _LSE_SPEC],
-            name="fa4_fwd_lse",
+            input_output_aliases=aliases,
+            name="fa4_fwd_lse" if aliases is None else "fa4_fwd_lse_dp",
         )
 
     def tangent(self, cfg, q, k, v, out, lse, dq, dk, dv, aux, seqlens=None):
@@ -713,13 +773,24 @@ class CuteBackend:
         )
         qspec = specs["q"]
         specs.update(dq=qspec, dk=qspec, dv=qspec, out=qspec, lse=_LSE_SPEC)
+        aliases = None
+        if cfg.defined_padding and seqlens is not None:
+            # Tangents of the padding are 0 (the tangent of a constant),
+            # including the mu/t_lse channel.
+            out_struct = self._out_struct(q, v)
+            lse_struct = self._lse_struct(q, seqlens)
+            tree["tout0"] = jnp.zeros(out_struct.shape, out_struct.dtype)
+            tree["tmu0"] = jnp.zeros(lse_struct.shape, lse_struct.dtype)
+            specs.update(tout0=qspec, tmu0=_LSE_SPEC)
+            aliases = self._tree_aliases(tree, tout0=0, tmu0=1)
         return cutejax.call(
             _fa4_jvp,
             [self._out_struct(q, v), self._lse_struct(q, seqlens)],
             tree,
             in_specs=self._in_specs(tree, specs),
             out_specs=[qspec, _LSE_SPEC],
-            name="fa4_jvp",
+            input_output_aliases=aliases,
+            name="fa4_jvp" if aliases is None else "fa4_jvp_dp",
         )
 
     def vjp(self, cfg, q, k, v, out, lse, d_out, d_lse, aux, seqlens=None):
@@ -847,21 +918,42 @@ class CuteBackend:
             name="fa4_bwd_pre_varlen",
         )
 
+        defined = cfg.defined_padding
         if ratio == 1:
-            dq_accum, dk, dv = cutejax.call(
-                _fa4_bwd_varlen,
-                [
-                    jax.ShapeDtypeStruct(dq_accum.shape, f32),
-                    jax.ShapeDtypeStruct(k.shape, k.dtype),
-                    jax.ShapeDtypeStruct(v.shape, v.dtype),
-                ],
-                st, q, k, v, d_out, lse_log2, dpsum, dq_accum,
-                cu_q, cu_k, su_q, su_k, tuple(aux),
-                in_specs=[_QKV3_SPEC] * 4 + [_F32_SPEC] * 3 + [None] * (4 + len(aux)),
-                out_specs=[_F32_SPEC, _QKV3_SPEC, _QKV3_SPEC],
-                input_output_aliases={6: 0},
-                name="fa4_bwd_varlen",
-            )
+            if defined:
+                # Donate zero-filled dK/dV: the epilogue's row-predicated
+                # stores never touch rows past seqused_k, so they stay 0.
+                dq_accum, dk, dv = cutejax.call(
+                    _fa4_bwd_varlen_dp,
+                    [
+                        jax.ShapeDtypeStruct(dq_accum.shape, f32),
+                        jax.ShapeDtypeStruct(k.shape, k.dtype),
+                        jax.ShapeDtypeStruct(v.shape, v.dtype),
+                    ],
+                    st, q, k, v, d_out, lse_log2, dpsum, dq_accum,
+                    jnp.zeros(k.shape, k.dtype), jnp.zeros(v.shape, v.dtype),
+                    cu_q, cu_k, su_q, su_k, tuple(aux),
+                    in_specs=[_QKV3_SPEC] * 4 + [_F32_SPEC] * 3 + [_QKV3_SPEC] * 2
+                    + [None] * (4 + len(aux)),
+                    out_specs=[_F32_SPEC, _QKV3_SPEC, _QKV3_SPEC],
+                    input_output_aliases={6: 0, 7: 1, 8: 2},
+                    name="fa4_bwd_varlen_dp",
+                )
+            else:
+                dq_accum, dk, dv = cutejax.call(
+                    _fa4_bwd_varlen,
+                    [
+                        jax.ShapeDtypeStruct(dq_accum.shape, f32),
+                        jax.ShapeDtypeStruct(k.shape, k.dtype),
+                        jax.ShapeDtypeStruct(v.shape, v.dtype),
+                    ],
+                    st, q, k, v, d_out, lse_log2, dpsum, dq_accum,
+                    cu_q, cu_k, su_q, su_k, tuple(aux),
+                    in_specs=[_QKV3_SPEC] * 4 + [_F32_SPEC] * 3 + [None] * (4 + len(aux)),
+                    out_specs=[_F32_SPEC, _QKV3_SPEC, _QKV3_SPEC],
+                    input_output_aliases={6: 0},
+                    name="fa4_bwd_varlen",
+                )
         else:
             s_kv_pad = _round_up(total_k, bwd_tile) + n_batch * bwd_tile
             dk_accum = jnp.zeros((h_kv, s_kv_pad * d_pad), f32)
@@ -880,32 +972,44 @@ class CuteBackend:
                 input_output_aliases={6: 0, 7: 1, 8: 2},
                 name="fa4_bwd_gqa_varlen",
             )
-            dk = cutejax.call(
-                _fa4_bwd_post_varlen,
+            dk = self._post_varlen(
+                _fa4_bwd_post_varlen, _fa4_bwd_post_varlen_dp, defined,
                 jax.ShapeDtypeStruct(k.shape, k.dtype),
-                st, dk_accum, cu_k, su_k,
-                in_specs=[_F32_SPEC, None, None],
-                out_specs=_QKV3_SPEC,
-                name="fa4_bwd_post_dk_varlen",
+                st, dk_accum, cu_k, su_k, "fa4_bwd_post_dk_varlen",
             )
-            dv = cutejax.call(
-                _fa4_bwd_post_dv_varlen,
+            dv = self._post_varlen(
+                _fa4_bwd_post_dv_varlen, _fa4_bwd_post_dv_varlen_dp, defined,
                 jax.ShapeDtypeStruct(v.shape, v.dtype),
-                st, dv_accum, cu_k, su_k,
-                in_specs=[_F32_SPEC, None, None],
-                out_specs=_QKV3_SPEC,
-                name="fa4_bwd_post_dv_varlen",
+                st, dv_accum, cu_k, su_k, "fa4_bwd_post_dv_varlen",
             )
 
-        dq = cutejax.call(
-            _fa4_bwd_post_varlen,
+        dq = self._post_varlen(
+            _fa4_bwd_post_varlen, _fa4_bwd_post_varlen_dp, defined,
             jax.ShapeDtypeStruct((total_q, h, d), q.dtype),
-            st, dq_accum, cu_q, su_q,
-            in_specs=[_F32_SPEC, None, None],
-            out_specs=_QKV3_SPEC,
-            name="fa4_bwd_post_varlen",
+            st, dq_accum, cu_q, su_q, "fa4_bwd_post_varlen",
         )
         return dq, dk, dv
+
+    @staticmethod
+    def _post_varlen(fn, fn_dp, defined, struct, st, accum, cu, su, name):
+        """Accumulator -> grad postprocess; with defined_padding the output
+        buffer is donated zero-filled so unused rows stay 0."""
+        if defined:
+            return cutejax.call(
+                fn_dp, struct,
+                st, accum, cu, su, jnp.zeros(struct.shape, struct.dtype),
+                in_specs=[_F32_SPEC, None, None, _QKV3_SPEC],
+                out_specs=_QKV3_SPEC,
+                input_output_aliases={3: 0},
+                name=name + "_dp",
+            )
+        return cutejax.call(
+            fn, struct,
+            st, accum, cu, su,
+            in_specs=[_F32_SPEC, None, None],
+            out_specs=_QKV3_SPEC,
+            name=name,
+        )
 
 
 def _is_dynamic(leaf) -> bool:

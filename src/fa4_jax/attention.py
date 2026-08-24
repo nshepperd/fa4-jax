@@ -126,6 +126,11 @@ class AttnConfig:
     # Kernel-family override for the cute backend (e.g. 80 to run the
     # SM80-MMA kernels on newer hardware); None = follow the device.
     kernel_arch: int | None = None
+    # Varlen only: give unused rows (beyond seqused, or in cu_seqlens gaps)
+    # defined values — 0 in out/tangent/gradients, -inf in the LSE — instead
+    # of unspecified memory. Costs one buffer fill per output on the cute
+    # backend; the reference backend behaves this way regardless.
+    defined_padding: bool = False
 
     @property
     def n_aux(self) -> int:
@@ -464,7 +469,10 @@ def _check_qkv(q, k, v):
         )
 
 
-def _make_config(q, causal, window_size, scale, mask_def, backend, varlen, kernel_arch):
+def _make_config(
+    q, causal, window_size, scale, mask_def, backend, varlen, kernel_arch,
+    defined_padding=False,
+):
     left, right = window_size if window_size is not None else (None, None)
     causal, local, wl, wr = _resolve_causal_local_window(
         causal,
@@ -482,6 +490,7 @@ def _make_config(q, causal, window_size, scale, mask_def, backend, varlen, kerne
         backend=backend if backend is not None else _default_backend(),
         varlen=varlen,
         kernel_arch=None if kernel_arch is None else int(kernel_arch),
+        defined_padding=bool(defined_padding),
     )
 
 
@@ -572,6 +581,7 @@ def flash_attn_varlen(
     return_lse: bool = False,
     backend: str | None = None,
     kernel_arch: int | None = None,
+    defined_padding: bool = False,
 ):
     """Variable-length (packed / ragged) FlashAttention-4.
 
@@ -613,6 +623,13 @@ def flash_attn_varlen(
             with no visible key).
         backend: as in :func:`flash_attn`.
         kernel_arch: as in :func:`flash_attn`.
+        defined_padding: unused rows — beyond ``seqused``, or tokens not
+            covered by any sequence — are normally *unspecified* in the
+            outputs and their gradients. With ``True`` they are defined:
+            0 in the output, its tangent, and dq/dk/dv, and ``-inf`` in the
+            LSE (the reference backend's convention, so the backends agree
+            on the full buffer). Costs one buffer fill per output on the
+            cute backend.
 
     Returns:
         ``(total_q, q_heads, head_dim_v)`` in q's dtype, plus the LSE if
@@ -667,7 +684,10 @@ def flash_attn_varlen(
             raise TypeError(f"{name} must be an integer array, got {su.dtype}")
         seqused.append(su.astype(jnp.int32))
     aux_tensors, mask_def = _flatten_mask(mask_mod)
-    cfg = _make_config(q, causal, window_size, scale, mask_def, backend, varlen=True, kernel_arch=kernel_arch)
+    cfg = _make_config(
+        q, causal, window_size, scale, mask_def, backend, varlen=True,
+        kernel_arch=kernel_arch, defined_padding=defined_padding,
+    )
     res = fa4_fwd_p.bind(
         q, k, v, cu_seqlens_q, cu_seqlens_k, *seqused, *aux_tensors,
         cfg=cfg, need_lse=return_lse,

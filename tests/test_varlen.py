@@ -626,6 +626,207 @@ def test_seqused_full_slots_matches_plain_varlen():
     assert_close(a, b, atol=0, rtol=0)
 
 
+# ------------------------------------------------------- seqused NaN padding
+#
+# Tokens beyond seqused[b] are dead storage — a partially-filled KV cache is
+# full of freshly-allocated or stale garbage, NaN included. The contract: the
+# *values* in that padding must never reach a used row of the outputs or
+# gradients. Baseline is the same kernel on zero-filled padding; used rows
+# must agree. Slot sizes straddle the 128 tile in every phase (sub-tile slot,
+# used length crossing a tile boundary, off-by-one from full, fully unused).
+
+NAN_PAD_SLOTS = [64, 192, 256, 128]
+NAN_PAD_USED_Q = [50, 129, 1, 0]
+NAN_PAD_USED_K = [30, 100, 255, 64]
+
+
+def _nan_pad_case(seed=11):
+    q, k, v, cu, _ = pack(NAN_PAD_SLOTS, None, dtype=jnp.bfloat16, seed=seed)
+    su_q = jnp.asarray(NAN_PAD_USED_Q, jnp.int32)
+    su_k = jnp.asarray(NAN_PAD_USED_K, jnp.int32)
+    return q, k, v, cu, su_q, su_k
+
+
+def _fill_padding(x, cu, su, value):
+    pad = jnp.asarray(~used_rows(cu, su))[:, None, None]
+    return jnp.where(pad, jnp.asarray(value, x.dtype), x)
+
+
+def _poisoned_and_clean(q, k, v, cu, su_q, su_k, poison):
+    """(dirty, clean) triples: `clean` zero-fills all padding, `dirty` is
+    identical except the poisoned tensor's padding holds NaN."""
+    sus = dict(q=su_q, k=su_k, v=su_k)
+    clean = tuple(
+        _fill_padding(x, cu, sus[n], 0) for n, x in zip("qkv", (q, k, v))
+    )
+    dirty = tuple(
+        _fill_padding(x, cu, sus[n], np.nan if n == poison else 0)
+        for n, x in zip("qkv", (q, k, v))
+    )
+    return dirty, clean
+
+
+POISONS = pytest.mark.parametrize("poison", ["q", "k", "v"])
+
+
+@cuda
+@POISONS
+@pytest.mark.parametrize("kw", MASKING, ids=["plain", "causal", "window"])
+def test_fwd_seqused_nan_padding(poison, kw):
+    q, k, v, cu, su_q, su_k = _nan_pad_case()
+    dirty, clean = _poisoned_and_clean(q, k, v, cu, su_q, su_k, poison)
+    call = lambda q, k, v: flash_attn_varlen(
+        q, k, v, cu, cu, seqused_q=su_q, seqused_k=su_k,
+        return_lse=True, backend="cute", **kw,
+    )
+    got, lse_got = call(*dirty)
+    want, lse_want = call(*clean)
+    rows = used_rows(cu, su_q)
+    got_m, want_m = _masked(got, rows), _masked(want, rows)
+    assert np.isfinite(np.asarray(got_m)).all(), f"NaN/Inf in out ({poison} poisoned)"
+    assert_close(got_m, want_m, dtype=q.dtype)
+    # lse is legitimately -inf on rows with no visible key; NaN is the bug.
+    lse_got_m = np.asarray(jnp.where(jnp.asarray(rows)[None], lse_got, 0.0))
+    lse_want_m = np.asarray(jnp.where(jnp.asarray(rows)[None], lse_want, 0.0))
+    assert not np.isnan(lse_got_m).any(), f"NaN in lse ({poison} poisoned)"
+    np.testing.assert_allclose(lse_got_m, lse_want_m, atol=1e-3, rtol=1e-3)
+
+
+@cuda
+@POISONS
+@pytest.mark.parametrize("causal", [False, True], ids=["plain", "causal"])
+def test_grad_seqused_nan_padding(poison, causal):
+    q, k, v, cu, su_q, su_k = _nan_pad_case(seed=12)
+    dirty, clean = _poisoned_and_clean(q, k, v, cu, su_q, su_k, poison)
+    rows_q, rows_k = used_rows(cu, su_q), used_rows(cu, su_k)
+
+    # A real loss never reads unspecified rows: cotangent 0 on padding.
+    def loss(q, k, v):
+        out = flash_attn_varlen(
+            q, k, v, cu, cu, seqused_q=su_q, seqused_k=su_k,
+            causal=causal, backend="cute",
+        )
+        return _masked(out, rows_q).sum()
+
+    got = jax.grad(loss, argnums=(0, 1, 2))(*dirty)
+    want = jax.grad(loss, argnums=(0, 1, 2))(*clean)
+    for g, w, name, rows in zip(got, want, "qkv", (rows_q, rows_k, rows_k)):
+        g_m, w_m = _masked(g, rows), _masked(w, rows)
+        assert np.isfinite(np.asarray(g_m)).all(), (
+            f"NaN/Inf in d{name} ({poison} poisoned)"
+        )
+        assert_close(g_m, w_m, dtype=q.dtype, msg=f"d{name} ({poison} poisoned)")
+
+
+@cuda
+@POISONS
+@pytest.mark.parametrize("causal", [False, True], ids=["plain", "causal"])
+def test_jvp_seqused_nan_padding(poison, causal):
+    """Tangent padding is as dead as primal padding: poison both together."""
+    q, k, v, cu, su_q, su_k = _nan_pad_case(seed=13)
+    rng = np.random.default_rng(14)
+    tq, tk, tv = (
+        jnp.asarray(rng.standard_normal(t.shape), t.dtype) for t in (q, k, v)
+    )
+    dirty, clean = _poisoned_and_clean(q, k, v, cu, su_q, su_k, poison)
+    tdirty, tclean = _poisoned_and_clean(tq, tk, tv, cu, su_q, su_k, poison)
+    f = lambda q, k, v: flash_attn_varlen(
+        q, k, v, cu, cu, seqused_q=su_q, seqused_k=su_k,
+        causal=causal, backend="cute",
+    )
+    out_got, t_got = jax.jvp(f, dirty, tdirty)
+    out_want, t_want = jax.jvp(f, clean, tclean)
+    rows = used_rows(cu, su_q)
+    for g, w, name in ((out_got, out_want, "out"), (t_got, t_want, "t_out")):
+        g_m, w_m = _masked(g, rows), _masked(w, rows)
+        assert np.isfinite(np.asarray(g_m)).all(), (
+            f"NaN/Inf in {name} ({poison} poisoned)"
+        )
+        assert_close(g_m, w_m, dtype=q.dtype, msg=f"{name} ({poison} poisoned)")
+
+
+@cuda
+@pytest.mark.parametrize("poison", ["clean", "nan"])
+def test_defined_padding(poison):
+    """defined_padding=True pins unused rows: 0 in out/t_out/dq/dk/dv, -inf
+    in the LSE — even when the input padding is NaN — without perturbing the
+    used rows. With it, whole-buffer reductions (plain .sum() losses,
+    global grad norms) are well-defined."""
+    q, k, v, cu, su_q, su_k = _nan_pad_case(seed=16)
+    if poison == "nan":
+        q = _fill_padding(q, cu, su_q, np.nan)
+        k = _fill_padding(k, cu, su_k, np.nan)
+        v = _fill_padding(v, cu, su_k, np.nan)
+    kw = dict(seqused_q=su_q, seqused_k=su_k, causal=True, backend="cute")
+    dp = dict(kw, defined_padding=True)
+    rows_q, rows_k = used_rows(cu, su_q), used_rows(cu, su_k)
+    pad_q, pad_k = ~rows_q, ~rows_k
+
+    out, lse = flash_attn_varlen(q, k, v, cu, cu, return_lse=True, **dp)
+    assert (np.asarray(out)[pad_q] == 0).all()
+    assert (np.asarray(lse)[:, pad_q] == -np.inf).all()
+    assert not np.isnan(np.asarray(lse)).any()
+
+    # a whole-buffer loss is legitimate under defined_padding
+    loss = lambda q, k, v: flash_attn_varlen(q, k, v, cu, cu, **dp).sum()
+    dq, dk, dv = jax.grad(loss, argnums=(0, 1, 2))(q, k, v)
+    for g, pad, name in ((dq, pad_q, "dq"), (dk, pad_k, "dk"), (dv, pad_k, "dv")):
+        g = np.asarray(g, np.float32)
+        assert (g[pad] == 0).all(), f"{name} padding not zeroed"
+        assert np.isfinite(g).all(), f"{name} not finite"
+
+    f = lambda q, k, v: flash_attn_varlen(q, k, v, cu, cu, **dp)
+    tq, tk, tv = (jnp.ones_like(t) for t in (q, k, v))
+    _, tout = jax.jvp(f, (q, k, v), (tq, tk, tv))
+    assert (np.asarray(tout)[pad_q] == 0).all()
+
+    # the flag must not perturb used rows: compare against the plain call
+    want = flash_attn_varlen(q, k, v, cu, cu, **kw)
+    assert_close(_masked(out, rows_q), _masked(want, rows_q), atol=0, rtol=0)
+
+
+@cuda
+def test_defined_padding_matches_reference_unmasked():
+    """With defined_padding the cute backend agrees with the reference on the
+    *entire* buffer — no used-row masking needed."""
+    q, k, v, cu, su_q, su_k = _nan_pad_case(seed=17)
+    kw = dict(seqused_q=su_q, seqused_k=su_k, causal=True, defined_padding=True)
+    got, lse_got = flash_attn_varlen(
+        q, k, v, cu, cu, return_lse=True, backend="cute", **kw
+    )
+    want, lse_want = flash_attn_varlen(
+        q, k, v, cu, cu, return_lse=True, backend="reference", **kw
+    )
+    assert_close(got, want, dtype=q.dtype)
+    np.testing.assert_allclose(
+        np.asarray(lse_got), np.asarray(lse_want), atol=1e-3, rtol=1e-3
+    )
+
+
+@cuda
+def test_fwd_seqused_zero_used_k_ignores_neighbor_padding():
+    """A slot with seqused_k == 0 must not read the *previous* slot's padding
+    (a kernel that clamps its tile index to block -1 lands there): its used
+    q rows contractually return zeros."""
+    q, k, v, cu, _ = pack([256, 64], None, dtype=jnp.bfloat16, seed=15)
+    su_q = jnp.asarray([4, 4], jnp.int32)
+    su_k = jnp.asarray([200, 0], jnp.int32)
+    poison = lambda x: _fill_padding(x, cu, su_k, np.nan)
+    got = flash_attn_varlen(
+        q, poison(k), poison(v), cu, cu,
+        seqused_q=su_q, seqused_k=su_k, backend="cute",
+    )
+    slot1 = np.asarray(got[256 : 256 + 4], np.float32)
+    assert np.isfinite(slot1).all(), "slot with seqused_k=0 read neighbor padding"
+    np.testing.assert_array_equal(slot1, 0.0)
+    # slot 0's own used rows must match the zero-padded baseline too
+    want = flash_attn_varlen(
+        q, _fill_padding(k, cu, su_k, 0), _fill_padding(v, cu, su_k, 0), cu, cu,
+        seqused_q=su_q, seqused_k=su_k, backend="cute",
+    )
+    assert_close(got[:4], want[:4], dtype=q.dtype)
+
+
 # ---------------------------------------------------------------- jvp
 
 
