@@ -7,8 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "jax>=0.8.0",
     "jaxtyping",
-    # JAX <-> CuTe DSL bridge (pytree args as codegen, per-dim static specs).
-    "cutejax",
+    "cutejax>=0.1.3",
     # The vendored flash_attn.cute kernels import quack's copy/layout helpers.
     "quack-kernels",
     "nvidia-cutlass-dsl>=4.7",
@@ -23,12 +22,11 @@ cu13 = ["jax[cuda13]", "nvidia-cutlass-dsl[cu13]>=4.7.0"]
 # flash-attn-4's cutlass pin doesn't apply here (we vendor the kernels), but
 # quack-kernels may pin an older cutlass-dsl; the kernels run fine on 4.7+.
 override-dependencies = ["nvidia-cutlass-dsl>=4.7"]
-# cutejax is our own package; exempt it from the global exclude-newer release-age rule.
-exclude-newer-package = { cutejax = "2100-01-01" }
 
 [dependency-groups]
 dev = [
     "pytest>=8",
+    "cutejax @ git+https://github.com/nshepperd/cutejax"
 ]
 
 [build-system]

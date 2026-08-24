@@ -11,9 +11,6 @@ resolution-markers = [
 exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
 exclude-newer-span = "P7D"
 
-[options.exclude-newer-package]
-cutejax = "2100-01-01T13:00:00Z"
-
 [manifest]
 overrides = [{ name = "nvidia-cutlass-dsl", specifier = ">=4.7" }]
 
@@ -170,16 +167,12 @@ nvtx = [
 
 [[package]]
 name = "cutejax"
-version = "0.1.0"
-source = { registry = "https://pypi.org/simple" }
+version = "0.1.3"
+source = { git = "https://github.com/nshepperd/cutejax#536f97b0fa41693a6798a0a7b5cfb4a591d7d3c0" }
 dependencies = [
     { name = "jax" },
     { name = "jax-tvm-ffi" },
     { name = "nvidia-cutlass-dsl" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/e4/7e/b8e7c9429364ae1df61df1d4ea8330e2e603d13ada7d41379826972007b9/cutejax-0.1.0.tar.gz", hash = "sha256:f263626da8e9bce80ac12c3ee6774f1ab8400f3148d183e6e19ffa7e7772075d", size = 91082, upload-time = "2026-08-23T01:38:58.18Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/0d/41/d73bdb5c08332e91d9d50542925b2489428ad728b37e775350ea9bfb5d2a/cutejax-0.1.0-py3-none-any.whl", hash = "sha256:f9e5a756d14854a2f514872fa6fb39850ea3930f4ba8d440713b4c4829e3e1ba", size = 17788, upload-time = "2026-08-23T01:38:56.842Z" },
 ]
 
 [[package]]
@@ -211,12 +204,13 @@ cu13 = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "cutejax" },
     { name = "pytest" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "cutejax" },
+    { name = "cutejax", specifier = ">=0.1.3" },
     { name = "jax", specifier = ">=0.8.0" },
     { name = "jax", extras = ["cuda13"], marker = "extra == 'cu13'" },
     { name = "jaxtyping" },
@@ -227,7 +221,10 @@ requires-dist = [
 provides-extras = ["cu13"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=8" }]
+dev = [
+    { name = "cutejax", git = "https://github.com/nshepperd/cutejax" },
+    { name = "pytest", specifier = ">=8" },
+]
 
 [[package]]
 name = "filelock"
@@ -324,17 +321,17 @@ with-cuda = [
 
 [[package]]
 name = "jax-tvm-ffi"
-version = "0.1.3"
+version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "jax" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d7/00/fb376997f2a8eedc9a16be2ceecbff71ae7ed7dcf3de8db1763afb6dd17d/jax_tvm_ffi-0.1.3.tar.gz", hash = "sha256:e85813d8936f0932b429e01535cc31d5ef20a3a4e66e3cca7cada1d25804fed1", size = 43663, upload-time = "2026-04-13T18:50:54.414Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/cc/a8/215d2e53aca8b663e3695d1527aa48f17562b862e6bfcf058bf59f9c7d86/jax_tvm_ffi-0.1.2.tar.gz", hash = "sha256:e3146f2c3ad9cf1fc380f7d41decd2c76491c58c60e4c9cda71080ffd83be001", size = 41269, upload-time = "2025-12-10T22:53:46.339Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c0/cd/786db3dfeb576f572eaf95ba4a53714582625042e7467b4211837484c163/jax_tvm_ffi-0.1.3-py3-none-macosx_11_0_arm64.whl", hash = "sha256:76c6930552e87c81f2c0b3a3e29f78c75a1a86cbe861b921ccce3d76d7ae0047", size = 83055, upload-time = "2026-04-13T18:50:50.794Z" },
-    { url = "https://files.pythonhosted.org/packages/3c/79/2fa9383f7661a488d1b48e1fece1d1c269fd67bb3714a6a38f1ca78602ee/jax_tvm_ffi-0.1.3-py3-none-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:1be7ae9835d8af983d530a588ed827fa9ad51e6585cd18939ba22ff81bcb8e11", size = 94413, upload-time = "2026-04-13T18:50:51.943Z" },
-    { url = "https://files.pythonhosted.org/packages/a6/6e/87f2cd87be34184c26c3b23c6ce55d9110761e523b5a8a712d115d871514/jax_tvm_ffi-0.1.3-py3-none-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:96d339979da2eb3cd82fb7d4bea93aa513783d2ebedf59ce356b617eb7e8481e", size = 102684, upload-time = "2026-04-13T18:50:53.017Z" },
+    { url = "https://files.pythonhosted.org/packages/32/33/a3a9ff8d583c17f161745937e5ff9bab580aac2c230fa05669f014f33b68/jax_tvm_ffi-0.1.2-py3-none-macosx_11_0_arm64.whl", hash = "sha256:3936d145b3a94f6cd56a0929440bd4eef41b25f43c99ca54703cf5bd460743db", size = 82587, upload-time = "2025-12-10T22:53:42.3Z" },
+    { url = "https://files.pythonhosted.org/packages/3a/a1/3baf37e33f1c535f0a52c26159d28ceb7fce803b9889b5c0bbd9e8eae1ec/jax_tvm_ffi-0.1.2-py3-none-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:2dea8dc19b3fb148abe2914fb0613d223ec58f8ef43b6ba2b058cf90e3d17ad1", size = 93901, upload-time = "2025-12-10T22:53:43.719Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/e1/969b44c3d5f02615d5e4fd3ea8835b9bbf5d50b3912220b5bf07742a71fd/jax_tvm_ffi-0.1.2-py3-none-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0bedff48fc29e46c17158b87ccc0ba134be7caac809c9fc5c2af5b1b1396305c", size = 101810, upload-time = "2025-12-10T22:53:45.026Z" },
 ]
 
 [[package]]
