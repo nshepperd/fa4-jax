@@ -5,6 +5,10 @@ Public surface:
 - ``flash_attn`` — attention with causal/sliding-window/flex masking,
   reverse-mode (FA4 backward kernels) *and* forward-mode (fused JVP tangent
   kernel) differentiation.
+- ``flash_attn_varlen`` — the same over packed variable-length batches:
+  ``(total_tokens, heads, head_dim)`` tensors delimited by int32
+  ``cu_seqlens`` offset arrays, no padding. Reverse mode runs the FA4 varlen
+  backward kernels; forward mode is reference-backend only for now.
 - ``MaskMod`` (a callable-pytree base class: array fields are runtime data,
   ``static()`` fields are compile-time) and the masks/combinators in
   ``fa4_jax.masks`` — flex-attention style mask mods that run both as CuTe
@@ -17,7 +21,7 @@ cutejax) load lazily on first GPU-backend call, so the reference backend and
 the unit tests work on machines with no GPU stack at all.
 """
 
-from fa4_jax.attention import flash_attn
+from fa4_jax.attention import flash_attn, flash_attn_varlen
 from fa4_jax.masks import (
     FnMask,
     MaskMod,
@@ -28,7 +32,7 @@ from fa4_jax.masks import (
     sliding_window_mask,
     static,
 )
-from fa4_jax.reference import reference_attn
+from fa4_jax.reference import reference_attn, reference_attn_varlen
 
 __all__ = [
     "FnMask",
@@ -37,8 +41,10 @@ __all__ = [
     "causal_mask",
     "document_mask",
     "flash_attn",
+    "flash_attn_varlen",
     "or_masks",
     "reference_attn",
+    "reference_attn_varlen",
     "sliding_window_mask",
     "static",
 ]

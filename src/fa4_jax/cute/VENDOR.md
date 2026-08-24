@@ -31,7 +31,12 @@ drag in. The SM100 files were taken from the same 4.0.0b26 wheel
   but those instructions exist on every supported arch, so the same kernel
   also serves sm_100/sm_120.
 - `flash_bwd.py` (SM80/SM120 backward): mask_mod + aux tensors added
-  (upstream's SM100 backward already has them).
+  (upstream's SM100 backward already has them). Also a varlen+GQA fix: the
+  dK/dV atomic-accumulate path offset its fp32 accumulators by the *raw*
+  `offset_k + batch_idx * n_block_size` while the postprocess kernel (and
+  the dQaccum path in the same kernel) use `SeqlenInfoQK`'s tile-rounded
+  padded offset — correct only when every sequence length is a tile
+  multiple. Now uses `seqlen.padded_offset_k`.
 - `mask.py`: the FlexAttention mask_mod element loops extracted into methods
   (`apply_mask_mod_sm80`, `apply_mask_mod_sm100_transposed`), and every
   `apply_mask*` entry point runs the mod as a second masking pass when it is

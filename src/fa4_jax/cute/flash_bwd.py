@@ -1206,7 +1206,13 @@ class FlashAttentionBackwardSm80:
             if cutlass.const_expr(not seqlen.has_cu_seqlens_k):
                 mdK_cur, mdV_cur = [t[batch_idx, head_idx_kv, None] for t in (mdK, mdV)]
             else:
-                padded_offset_k = seqlen.offset_k + batch_idx * self.n_block_size
+                # fa4-jax fix: use the tile-rounded padded offset (as dQaccum
+                # above and the postprocess kernel do). Upstream computed
+                # offset_k + batch_idx * n_block_size unrounded, which agrees
+                # only when every sequence length is a tile multiple; for
+                # ragged packings dK/dV accumulated shifted by offset_k %
+                # n_block_size rows relative to where the postprocess reads.
+                padded_offset_k = seqlen.padded_offset_k
                 mdK_cur = cute.domain_offset((padded_offset_k * self.head_dim_padded,), mdK[head_idx_kv, None])
                 mdV_cur = cute.domain_offset((padded_offset_k * self.head_dim_v_padded,), mdV[head_idx_kv, None])
 

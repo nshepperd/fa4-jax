@@ -19,18 +19,27 @@ What it provides over `jax.nn.dot_product_attention`:
   (`fa4_jax/cute/flash_jvp.py`, ours — upstream has no JVP). Built on custom
   primitives with a linear tangent + transpose rule, not `jax.custom_vjp`,
   which would forbid forward mode.
+- **Varlen (packed) attention** — `flash_attn_varlen` takes a batch of
+  different-length sequences concatenated along the token axis with no
+  padding, delimited by int32 `cu_seqlens` offset arrays (the flash-attention
+  varlen convention). One compile serves every packing: token counts *and*
+  batch size stay symbolic.
 - **A pure-JAX reference backend** with identical semantics (including the
   differentiation wiring) — the ground truth the kernels are tested against,
   and `flash_attn(..., backend="reference")` works anywhere.
 
 ```python
 import jax.numpy as jnp
-from fa4_jax import flash_attn, document_mask
+from fa4_jax import flash_attn, flash_attn_varlen, document_mask
 
 out = flash_attn(q, k, v, causal=True)                       # (b, s, h, d) bf16/fp16
 out = flash_attn(q, k, v, window_size=(128, 128))            # two-sided local
 out = flash_attn(q, k, v, mask_mod=document_mask(doc_ids))   # flex: block-diag by (b, s) int32 id
 out, lse = flash_attn(q, k, v, return_lse=True)
+
+# Packed varlen: q (total_q, h, d), sequence b is q[cu_q[b]:cu_q[b+1]].
+cu = jnp.asarray([0, 17, 300, 428], jnp.int32)               # 3 sequences
+out = flash_attn_varlen(q, k, v, cu, cu, causal=True)        # (total_q, h, d)
 ```
 
 Custom masks are frozen dataclasses subclassing `MaskMod`; array fields are
@@ -53,6 +62,18 @@ flash-attention convention: the last query lines up with the last key, so
 decode / chunked prefill just works). Mask mods see raw indices, so
 `mask_mod=causal_mask()` is top-left and only equals `causal=True` when the
 lengths match.
+
+Varlen semantics: attention never crosses sequences; `causal`/`window_size`
+apply per sequence, bottom-right aligned within it (`cu_seqlens_q` and
+`cu_seqlens_k` may pack differently — e.g. one query per sequence against
+long caches). Mask mods see the sequence index as `b` and sequence-local
+`q_idx`/`kv_idx`. The LSE comes out `(heads, total_q)`. `cu_seqlens` contents
+are runtime data and unchecked: they must be nondecreasing, start at 0, and
+end at the token count (uncovered tokens get unspecified outputs/gradients).
+Zero-length sequences are fine. Reverse mode runs the FA4 varlen backward;
+forward mode (`jax.jvp`) is reference-backend only for now (the tangent
+kernel has no packed layout); `vmap` over a varlen call is rejected — the
+packing *is* the batch.
 
 Restrictions (kernel-side, all checked with clear errors): fp16/bf16, head_dim
 a multiple of 8 and ≤ 128 (the SM80/SM120 tile budget; on sm_100, larger heads

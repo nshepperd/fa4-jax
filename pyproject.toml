@@ -49,4 +49,7 @@ exclude = ["src/fa4_jax/cute/*"]
 
 [tool.ty.environment]
 root = ["./src/"]
-extra-paths = [".venv/lib/python3.14/site-packages/nvidia_cutlass_dsl/dsl_packages"]
+extra-paths = [
+    ".venv/lib/python3.14/site-packages/nvidia_cutlass_dsl/dsl_packages", 
+    "./tests" # import conftest
+]

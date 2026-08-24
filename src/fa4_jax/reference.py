@@ -37,7 +37,7 @@ from jaxtyping import Array, Bool, Float
 
 from fa4_jax.masks import MaskMod
 
-__all__ = ["reference_attn"]
+__all__ = ["reference_attn", "reference_attn_varlen"]
 
 
 def dense_mask(
@@ -113,11 +113,121 @@ def fwd_lse(q, k, v, scale: float, causal: bool, window, mask_mod: MaskMod | Non
 
 
 def _expand_kv(x: Array, q_heads: int) -> Array:
-    """Repeat kv heads up to q heads (GQA)."""
-    kv_heads = x.shape[2]
+    """Repeat kv heads up to q heads (GQA); heads is the next-to-last axis."""
+    kv_heads = x.shape[-2]
     if kv_heads == q_heads:
         return x
-    return jnp.repeat(x, q_heads // kv_heads, axis=2)
+    return jnp.repeat(x, q_heads // kv_heads, axis=-2)
+
+
+# ---------------------------------------------------------------- varlen
+
+
+def varlen_dense_mask(
+    heads: int,
+    cu_seqlens_q: Array,
+    cu_seqlens_k: Array,
+    total_q: int,
+    total_k: int,
+    causal: bool,
+    window: tuple[int | None, int | None],
+    mask_mod: MaskMod | None,
+) -> Bool[Array, "heads total_q total_k"]:
+    """The dense visibility mask for packed varlen attention.
+
+    Tokens attend only within their own sequence (segment). ``causal``/
+    ``window`` are bottom-right aligned *per sequence*: query ``i`` of
+    sequence ``b`` sits at key position ``i + (len_k_b - len_q_b)``. A
+    ``mask_mod`` sees the sequence index as ``b`` and **sequence-local**
+    ``q_idx``/``kv_idx`` — the same convention as the CuTe kernels, whose
+    tiles are addressed relative to each sequence's start.
+    """
+    iq = jnp.arange(total_q)
+    ik = jnp.arange(total_k)
+    # Segment of each token: cu_seqlens is nondecreasing with cu[0] == 0, so
+    # right-searchsorted maps token i to the sequence whose half-open range
+    # holds it (zero-length sequences are skipped over correctly).
+    seg_q = jnp.searchsorted(cu_seqlens_q, iq, side="right") - 1
+    seg_k = jnp.searchsorted(cu_seqlens_k, ik, side="right") - 1
+    q_local = iq - cu_seqlens_q[seg_q]
+    k_local = ik - cu_seqlens_k[seg_k]
+    len_q = cu_seqlens_q[seg_q + 1] - cu_seqlens_q[seg_q]
+    len_k = cu_seqlens_k[seg_q + 1] - cu_seqlens_k[seg_q]  # K length of q's sequence
+    q_pos = q_local + (len_k - len_q)  # the query's position on its key axis
+
+    mask = seg_q[:, None] == seg_k[None, :]
+    if causal:
+        mask = mask & (k_local[None, :] <= q_pos[:, None])
+    left, right = window
+    if left is not None:
+        mask = mask & (q_pos[:, None] - k_local[None, :] <= left)
+    if right is not None:
+        mask = mask & (k_local[None, :] - q_pos[:, None] <= right)
+    mask = jnp.broadcast_to(mask[None], (heads, total_q, total_k))
+    if mask_mod is not None:
+        h = jnp.arange(heads)[:, None, None]
+        mm = mask_mod(seg_q[None, :, None], h, q_local[None, :, None], k_local[None, None, :])
+        mask = mask & jnp.broadcast_to(mm, mask.shape)
+    return mask
+
+
+def varlen_fwd_lse(
+    q, k, v, cu_seqlens_q, cu_seqlens_k, scale: float, causal: bool, window, mask_mod
+):
+    """Packed-varlen ``(out, lse)`` in float32 from float32 inputs.
+
+    Same structure as :func:`fwd_lse` with the batch folded into one packed
+    sequence of ``total`` tokens and the segment structure expressed through
+    the dense mask; ``lse`` comes out ``(heads, total_q)``.
+    """
+    total_q, h, d = q.shape
+    total_k, d_v = k.shape[0], v.shape[2]
+    full = varlen_dense_mask(
+        h, cu_seqlens_q, cu_seqlens_k, total_q, total_k, causal, window, mask_mod
+    )
+
+    dd = max(d, d_v)
+    pad = lambda x: jnp.pad(x, ((0, 0), (0, 0), (0, dd - x.shape[2])))
+    out = jax.nn.dot_product_attention(
+        pad(q)[None], pad(k)[None], pad(v)[None], mask=full[None],
+        scale=scale, implementation="xla",
+    )[0, ..., :d_v]
+
+    s = jnp.einsum("qhd,khd->hqk", q, _expand_kv(k, h)) * scale
+    s = jnp.where(full, s, -jnp.inf)
+    empty = ~full.any(-1)  # (h, total_q); tokens with no visible key
+    out = jnp.where(empty.T[..., None], 0.0, out)
+    lse = jax.nn.logsumexp(s, axis=-1)
+    return out, lse
+
+
+def reference_attn_varlen(
+    q: Float[Array, "total_q q_heads head_dim"],
+    k: Float[Array, "total_k kv_heads head_dim"],
+    v: Float[Array, "total_k kv_heads head_dim_v"],
+    cu_seqlens_q,
+    cu_seqlens_k,
+    *,
+    causal: bool = False,
+    window_size: tuple[int | None, int | None] | None = None,
+    scale: float | None = None,
+    mask_mod: MaskMod | None = None,
+    return_lse: bool = False,
+):
+    """Reference varlen attention with the semantics of ``flash_attn_varlen``.
+
+    Differentiable by ordinary JAX autodiff; the oracle the varlen kernels
+    are tested against.
+    """
+    scale = float(scale if scale is not None else 1.0 / math.sqrt(q.shape[-1]))
+    window = window_size if window_size is not None else (None, None)
+    f32 = jnp.float32
+    out, lse = varlen_fwd_lse(
+        q.astype(f32), k.astype(f32), v.astype(f32),
+        cu_seqlens_q, cu_seqlens_k, scale, causal, window, mask_mod,
+    )
+    out = out.astype(q.dtype)
+    return (out, lse) if return_lse else out
 
 
 def reference_attn(
