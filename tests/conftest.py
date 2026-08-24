@@ -5,7 +5,7 @@ import os
 # Share the GPU with whatever else is running: grow allocations on demand
 # instead of preallocating, and cap the pool. Must be set before jax imports.
 os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "cuda_async")
-os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.4")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.2")
 
 import jax
 import jax.numpy as jnp
