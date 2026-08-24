@@ -15,10 +15,8 @@ Kernel-side restrictions surface here as NotImplementedError:
   in fp32 across the q heads sharing a kv head, and two extra postprocess
   launches convert them (see the backward section). The JVP tangent kernel
   supports all of it.
-- varlen (packed) attention: forward and backward run the kernels' native
-  cu_seqlens path; the JVP tangent kernel has no packed layout yet, so
-  forward mode raises (reverse mode is unaffected — the tangent primitive
-  is transposed away before it would execute).
+- varlen (packed) attention: forward, backward, and the JVP tangent kernel
+  all run the native cu_seqlens/seqused path.
 - fp16/bf16 only, head_dim % 8 == 0 (validated with clear errors).
 
 Layout note (from fa4.py): heads and head_dim are baked into the kernel (they
@@ -196,12 +194,13 @@ def _aux_data(tree):
 
 @cute.jit
 def _fa4_fwd(stream, tree, mO):
-    # The cu_seqlens keys exist only in varlen trees; dict membership is a
+    # The seqlen keys exist only in varlen trees; dict membership is a
     # trace-time constant, so the non-varlen compile is unchanged.
     wl, wr = _windows(tree)
     tree["fa"](
         tree["q"], tree["k"], tree["v"], mO, None, tree["scale"],
         mCuSeqlensQ=tree.get("cu_q"), mCuSeqlensK=tree.get("cu_k"),
+        mSeqUsedQ=tree.get("su_q"), mSeqUsedK=tree.get("su_k"),
         window_size_left=wl, window_size_right=wr,
         aux_data=_aux_data(tree), stream=stream,
     )
@@ -214,6 +213,7 @@ def _fa4_fwd_lse(stream, tree, mO, mLSE):
     tree["fa"](
         tree["q"], tree["k"], tree["v"], mO, mLSE, tree["scale"],
         mCuSeqlensQ=tree.get("cu_q"), mCuSeqlensK=tree.get("cu_k"),
+        mSeqUsedQ=tree.get("su_q"), mSeqUsedK=tree.get("su_k"),
         window_size_left=wl, window_size_right=wr,
         aux_data=_aux_data(tree), stream=stream,
     )
@@ -425,15 +425,15 @@ def _fa4_bwd_post_dv(stream, tree, mdVaccum, mdV):
 
 
 # The varlen backward chain: same kernels, packed 3D tensors, and the
-# cu_seqlens arrays as explicit positional operands (the accumulators use
-# tile-padded per-sequence offsets, see `_vjp_varlen` for the sizing).
+# cu_seqlens/seqused arrays as explicit positional operands (the accumulators
+# use tile-padded per-sequence offsets, see `_vjp_varlen` for the sizing).
 
 
 @cute.jit
-def _fa4_bwd_pre_varlen(stream, tree, mO, mdO, mLSE, cu_q, mPdPsum, mLSElog2, mdQaccum):
+def _fa4_bwd_pre_varlen(stream, tree, mO, mdO, mLSE, cu_q, su_q, mPdPsum, mLSElog2, mdQaccum):
     tree["pre"](
         mO, mdO, mPdPsum, mLSE, mLSElog2, mdQaccum,
-        cu_q, None, None, None, None,  # cu_seqlens_q, seqused_q, dLSE, row_max, scale_p
+        cu_q, su_q, None, None, None,  # cu_seqlens_q, seqused_q, dLSE, row_max, scale_p
         cutlass.Float32(tree["scale"]),
         stream=stream,
     )
@@ -441,7 +441,8 @@ def _fa4_bwd_pre_varlen(stream, tree, mO, mdO, mLSE, cu_q, mPdPsum, mLSElog2, md
 
 @cute.jit
 def _fa4_bwd_varlen(
-    stream, tree, mQ, mK, mV, mdO, mLSElog2, mPdPsum, _mdQaccum_in, cu_q, cu_k, aux,
+    stream, tree, mQ, mK, mV, mdO, mLSElog2, mPdPsum, _mdQaccum_in,
+    cu_q, cu_k, su_q, su_k, aux,
     mdQaccum, mdK, mdV,
 ):
     from fa4_jax.cute.utils import AuxData
@@ -450,7 +451,7 @@ def _fa4_bwd_varlen(
     tree["bwd"](
         mQ, mK, mV, mdO, mLSElog2, mPdPsum, mdQaccum, mdK, mdV,
         cutlass.Float32(tree["scale"]),
-        cu_q, cu_k, None, None,  # cu_seqlens_q/k, seqused_q/k
+        cu_q, cu_k, su_q, su_k,
         window_size_left=wl,
         window_size_right=wr,
         aux_data=AuxData(tensors=aux) if cutlass.const_expr(len(aux) > 0) else AuxData(),
@@ -461,7 +462,7 @@ def _fa4_bwd_varlen(
 @cute.jit
 def _fa4_bwd_gqa_varlen(
     stream, tree, mQ, mK, mV, mdO, mLSElog2, mPdPsum, _mdQaccum_in, _mdKaccum_in,
-    _mdVaccum_in, cu_q, cu_k, aux, mdQaccum, mdKaccum, mdVaccum,
+    _mdVaccum_in, cu_q, cu_k, su_q, su_k, aux, mdQaccum, mdKaccum, mdVaccum,
 ):
     from fa4_jax.cute.utils import AuxData
 
@@ -469,7 +470,7 @@ def _fa4_bwd_gqa_varlen(
     tree["bwd"](
         mQ, mK, mV, mdO, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum,
         cutlass.Float32(tree["scale"]),
-        cu_q, cu_k, None, None,  # cu_seqlens_q/k, seqused_q/k
+        cu_q, cu_k, su_q, su_k,
         window_size_left=wl,
         window_size_right=wr,
         aux_data=AuxData(tensors=aux) if cutlass.const_expr(len(aux) > 0) else AuxData(),
@@ -478,22 +479,25 @@ def _fa4_bwd_gqa_varlen(
 
 
 @cute.jit
-def _fa4_bwd_post_varlen(stream, tree, mdAccum, cu, mdX):
-    """Accumulator -> dQ (or dK under GQA; the cu argument is the matching
-    q- or k-side cu_seqlens)."""
-    tree["post"](mdAccum, mdX, cutlass.Float32(tree["scale"]), cu, None, None, stream=stream)
+def _fa4_bwd_post_varlen(stream, tree, mdAccum, cu, su, mdX):
+    """Accumulator -> dQ (or dK under GQA; cu/su are the matching q- or
+    k-side seqlen arrays)."""
+    tree["post"](mdAccum, mdX, cutlass.Float32(tree["scale"]), cu, su, None, stream=stream)
 
 
 @cute.jit
-def _fa4_bwd_post_dv_varlen(stream, tree, mdVaccum, cu_k, mdV):
-    tree["post_v"](mdVaccum, mdV, cutlass.Float32(1.0), cu_k, None, None, stream=stream)
+def _fa4_bwd_post_dv_varlen(stream, tree, mdVaccum, cu_k, su_k, mdV):
+    tree["post_v"](mdVaccum, mdV, cutlass.Float32(1.0), cu_k, su_k, None, stream=stream)
 
 
 # ---------------------------------------------------------------- jvp tangent
 
 
 @functools.cache
-def _get_jvp(dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, local, mask_mod, n_aux, arch):
+def _get_jvp(dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, local, mask_mod, n_aux):
+    # No arch key: the one SM80-style tangent kernel serves every family
+    # (keeping it out of the cache key shares the compile across kernel_arch
+    # overrides).
     from fa4_jax.cute.flash_jvp import FlashAttentionJvpSm80
 
     # Six tensor tiles must fit where the forward keeps three; halve tile_m
@@ -521,6 +525,8 @@ def _fa4_jvp(stream, tree, mTO, mMu):
         tree["q"], tree["k"], tree["v"],
         tree["dq"], tree["dk"], tree["dv"],
         tree["out"], tree["lse"], mTO, mMu, tree["scale"],
+        mCuSeqlensQ=tree.get("cu_q"), mCuSeqlensK=tree.get("cu_k"),
+        mSeqUsedQ=tree.get("su_q"), mSeqUsedK=tree.get("su_k"),
         window_size_left=wl, window_size_right=wr,
         aux_data=_aux_data(tree), stream=stream,
     )
@@ -572,7 +578,7 @@ def _get_static(cfg: AttnConfig, dtype, head_dim, head_dim_v, qhead_per_kvhead, 
     elif kind == "jvp":
         st["jvp"] = _get_jvp(
             dtype, head_dim, head_dim_v, qhead_per_kvhead,
-            causal, local, mask_mod, cfg.n_aux, arch,
+            causal, local, mask_mod, cfg.n_aux,
         )
     return st
 
@@ -621,7 +627,23 @@ def _validate(cfg: AttnConfig, kind: str, q, k, v):
     head_dim, head_dim_v = q.shape[-1], v.shape[-1]
     if head_dim % 8 or head_dim_v % 8:
         raise ValueError(f"head dims must be multiples of 8, got {head_dim}, {head_dim_v}")
-    arch = _device_arch()
+    # kernel_arch picks the kernel *family* only; codegen always targets the
+    # real device (the classes read it via the DSL's arch enum), which is
+    # what lets e.g. the SM80-MMA kernels run on sm_100. Validate overrides
+    # up front: an unrunnable family would otherwise die deep inside kernel
+    # construction with an opaque assert.
+    if cfg.kernel_arch is not None:
+        from fa4_jax.attention import kernel_arch_unsupported
+
+        device = _device_arch()
+        reason = kernel_arch_unsupported(cfg.kernel_arch, device)
+        if reason is not None:
+            raise ValueError(
+                f"kernel_arch={cfg.kernel_arch}: {reason} (device is sm_{device})"
+            )
+        arch = cfg.kernel_arch
+    else:
+        arch = _device_arch()
     if not _can_implement(kind, dtype, head_dim, head_dim_v, cfg.causal, arch):
         raise ValueError(
             f"FA4 {kind} kernel cannot run head_dim={head_dim}, head_dim_v={head_dim_v} "
@@ -640,7 +662,8 @@ class CuteBackend:
         spec = _QKV_SPEC if seqlens is None else _QKV3_SPEC
         specs = {"q": spec, "k": spec, "v": spec}
         if seqlens is not None:
-            tree.update(cu_q=seqlens[0], cu_k=seqlens[1])
+            cu_q, cu_k, su_q, su_k = seqlens
+            tree.update(cu_q=cu_q, cu_k=cu_k, su_q=su_q, su_k=su_k)
         return tree, specs
 
     @staticmethod
@@ -685,27 +708,17 @@ class CuteBackend:
         )
 
     def tangent(self, cfg, q, k, v, out, lse, dq, dk, dv, aux, seqlens=None):
-        if seqlens is not None:
-            raise NotImplementedError(
-                "forward-mode (JVP) through flash_attn_varlen is not wired to "
-                "the cute tangent kernel yet; use backend='reference' for "
-                "forward-mode differentiation of varlen attention. (Reverse "
-                "mode / jax.grad is fully supported.)"
-            )
         tree, specs = self._tree(
-            cfg, "jvp", q, k, v, aux, dq=dq, dk=dk, dv=dv, out=out, lse=lse
+            cfg, "jvp", q, k, v, aux, seqlens, dq=dq, dk=dk, dv=dv, out=out, lse=lse
         )
-        specs.update(dq=_QKV_SPEC, dk=_QKV_SPEC, dv=_QKV_SPEC, out=_QKV_SPEC, lse=_LSE_SPEC)
-        b, s_q, h, _ = q.shape
+        qspec = specs["q"]
+        specs.update(dq=qspec, dk=qspec, dv=qspec, out=qspec, lse=_LSE_SPEC)
         return cutejax.call(
             _fa4_jvp,
-            [
-                jax.ShapeDtypeStruct((*q.shape[:3], v.shape[3]), q.dtype),
-                jax.ShapeDtypeStruct((b, h, s_q), jnp.float32),
-            ],
+            [self._out_struct(q, v), self._lse_struct(q, seqlens)],
             tree,
             in_specs=self._in_specs(tree, specs),
-            out_specs=[_QKV_SPEC, _LSE_SPEC],
+            out_specs=[qspec, _LSE_SPEC],
             name="fa4_jvp",
         )
 
@@ -798,7 +811,7 @@ class CuteBackend:
         )
         return dq, dk, dv
 
-    def _vjp_varlen(self, cfg, q, k, v, out, lse, d_out, aux, cu_q, cu_k):
+    def _vjp_varlen(self, cfg, q, k, v, out, lse, d_out, aux, cu_q, cu_k, su_q, su_k):
         """The backward chain over the packed layout.
 
         Same three kernels as the batched path; what changes is the fp32
@@ -828,8 +841,8 @@ class CuteBackend:
                 jax.ShapeDtypeStruct((h, s_q_pad), f32),
                 jax.ShapeDtypeStruct((h, s_q_pad * d_pad), f32),
             ],
-            st, out, d_out, lse, cu_q,
-            in_specs=[_QKV3_SPEC, _QKV3_SPEC, _LSE_SPEC, None],
+            st, out, d_out, lse, cu_q, su_q,
+            in_specs=[_QKV3_SPEC, _QKV3_SPEC, _LSE_SPEC, None, None],
             out_specs=_F32_SPEC,
             name="fa4_bwd_pre_varlen",
         )
@@ -842,8 +855,9 @@ class CuteBackend:
                     jax.ShapeDtypeStruct(k.shape, k.dtype),
                     jax.ShapeDtypeStruct(v.shape, v.dtype),
                 ],
-                st, q, k, v, d_out, lse_log2, dpsum, dq_accum, cu_q, cu_k, tuple(aux),
-                in_specs=[_QKV3_SPEC] * 4 + [_F32_SPEC] * 3 + [None] * (2 + len(aux)),
+                st, q, k, v, d_out, lse_log2, dpsum, dq_accum,
+                cu_q, cu_k, su_q, su_k, tuple(aux),
+                in_specs=[_QKV3_SPEC] * 4 + [_F32_SPEC] * 3 + [None] * (4 + len(aux)),
                 out_specs=[_F32_SPEC, _QKV3_SPEC, _QKV3_SPEC],
                 input_output_aliases={6: 0},
                 name="fa4_bwd_varlen",
@@ -860,8 +874,8 @@ class CuteBackend:
                     jax.ShapeDtypeStruct(dv_accum.shape, f32),
                 ],
                 st, q, k, v, d_out, lse_log2, dpsum, dq_accum, dk_accum, dv_accum,
-                cu_q, cu_k, tuple(aux),
-                in_specs=[_QKV3_SPEC] * 4 + [_F32_SPEC] * 5 + [None] * (2 + len(aux)),
+                cu_q, cu_k, su_q, su_k, tuple(aux),
+                in_specs=[_QKV3_SPEC] * 4 + [_F32_SPEC] * 5 + [None] * (4 + len(aux)),
                 out_specs=[_F32_SPEC] * 3,
                 input_output_aliases={6: 0, 7: 1, 8: 2},
                 name="fa4_bwd_gqa_varlen",
@@ -869,16 +883,16 @@ class CuteBackend:
             dk = cutejax.call(
                 _fa4_bwd_post_varlen,
                 jax.ShapeDtypeStruct(k.shape, k.dtype),
-                st, dk_accum, cu_k,
-                in_specs=[_F32_SPEC, None],
+                st, dk_accum, cu_k, su_k,
+                in_specs=[_F32_SPEC, None, None],
                 out_specs=_QKV3_SPEC,
                 name="fa4_bwd_post_dk_varlen",
             )
             dv = cutejax.call(
                 _fa4_bwd_post_dv_varlen,
                 jax.ShapeDtypeStruct(v.shape, v.dtype),
-                st, dv_accum, cu_k,
-                in_specs=[_F32_SPEC, None],
+                st, dv_accum, cu_k, su_k,
+                in_specs=[_F32_SPEC, None, None],
                 out_specs=_QKV3_SPEC,
                 name="fa4_bwd_post_dv_varlen",
             )
@@ -886,8 +900,8 @@ class CuteBackend:
         dq = cutejax.call(
             _fa4_bwd_post_varlen,
             jax.ShapeDtypeStruct((total_q, h, d), q.dtype),
-            st, dq_accum, cu_q,
-            in_specs=[_F32_SPEC, None],
+            st, dq_accum, cu_q, su_q,
+            in_specs=[_F32_SPEC, None, None],
             out_specs=_QKV3_SPEC,
             name="fa4_bwd_post_varlen",
         )

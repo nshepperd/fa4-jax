@@ -576,3 +576,36 @@ def test_remat():
 def test_public_surface():
     """fa4_jax package exposes what the README promises."""
     assert {"flash_attn", "MaskMod", "reference_attn"} <= set(fa4_jax.__all__)
+
+
+def test_kernel_arch_validation():
+    """Unrunnable kernel_arch values fail up front with a clear message,
+    not deep inside kernel construction."""
+    q, k, v = _mk((1, 64, 64, 1, 1, 64, None), jnp.bfloat16)
+    with pytest.raises(ValueError, match="not vendored"):
+        flash_attn(q, k, v, backend="cute", kernel_arch=90)
+    with pytest.raises(ValueError, match="unknown kernel family"):
+        flash_attn(q, k, v, backend="cute", kernel_arch=75)
+    import fa4_jax
+
+    with fa4_jax.default_kernel_arch(90), pytest.raises(ValueError, match="not vendored"):
+        flash_attn(q, k, v, backend="cute")
+
+
+def test_kernel_arch_param_overrides_fixture():
+    """The public kernel_arch argument selects the family per call,
+    independent of the device (and of this suite's family fixture): both
+    explicit choices must agree with the reference and with each other."""
+    q, k, v = _mk((1, 200, 200, 2, 1, 64, None), jnp.bfloat16)
+    want = flash_attn(q, k, v, causal=True, backend="reference")
+    outs = {}
+    for arch in (80, 120):
+        outs[arch] = flash_attn(q, k, v, causal=True, backend="cute", kernel_arch=arch)
+        assert_close(outs[arch], want, dtype=q.dtype, msg=f"kernel_arch={arch}")
+    grad80 = jax.grad(
+        lambda q: flash_attn(q, k, v, causal=True, backend="cute", kernel_arch=80).sum()
+    )(q)
+    grad_ref = jax.grad(
+        lambda q: flash_attn(q, k, v, causal=True, backend="reference").sum()
+    )(q)
+    assert_close(grad80, grad_ref, dtype=q.dtype)

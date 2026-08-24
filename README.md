@@ -70,10 +70,13 @@ long caches). Mask mods see the sequence index as `b` and sequence-local
 `q_idx`/`kv_idx`. The LSE comes out `(heads, total_q)`. `cu_seqlens` contents
 are runtime data and unchecked: they must be nondecreasing, start at 0, and
 end at the token count (uncovered tokens get unspecified outputs/gradients).
-Zero-length sequences are fine. Reverse mode runs the FA4 varlen backward;
-forward mode (`jax.jvp`) is reference-backend only for now (the tangent
-kernel has no packed layout); `vmap` over a varlen call is rejected — the
-packing *is* the batch.
+Zero-length sequences are fine. Optional `seqused_q`/`seqused_k` (int32
+`(batch,)`) limit each slot to its first `seqused[b]` tokens — the KV-cache
+case, where slots are allocated larger than currently filled; unused K is
+invisible, unused Q rows get unspecified outputs/gradients, and the
+band alignment uses the used lengths. Reverse mode runs the FA4 varlen
+backward and forward mode the fused varlen tangent kernel; `vmap` over a
+varlen call is rejected — the packing *is* the batch.
 
 Restrictions (kernel-side, all checked with clear errors): fp16/bf16, head_dim
 a multiple of 8 and ≤ 128 (the SM80/SM120 tile budget; on sm_100, larger heads
@@ -105,6 +108,22 @@ block sparsity, which is not wired up.
 ```sh
 uv run pytest              # kernels vs the jnp reference (fwd/grad/jvp/masks) + API checks; needs a CUDA device
 ```
+
+Every kernel-facing test is parametrized over the vendored kernel families
+(`sm80`/`sm90`/`sm100`/`sm120` test ids) and runs each one the device can
+actually execute — e.g. a B200 runs the SM80-MMA and SM120 variants as well
+as the native tcgen05 kernels, since cp.async/mma.sync exist there too. The
+rest show up as skips, so reports state exactly which implementations have
+coverage (`sm90` always skips: not vendored). `FA4_TEST_ARCHS=sm100` (comma
+list) restricts the sweep for quick iterations; the same selection is
+available to users as `flash_attn(..., kernel_arch=80)`.
+
+Run the all-family sweep as **one pytest process per family**
+(`FA4_TEST_ARCHS=sm80 uv run pytest`, then `sm120`, then `sm100`): each
+compiled kernel variant registers a JAX FFI target and jax-tvm-ffi caps a
+process at 1024 handlers — three families of kernels in one process blow
+through it mid-run and everything after fails with
+`cannot register more than 1024 handlers`.
 
 `conftest.py` sets `XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async` and
 `XLA_PYTHON_CLIENT_MEM_FRACTION=0.4` so the suite shares the GPU.

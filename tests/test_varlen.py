@@ -438,19 +438,259 @@ def test_grad_with_unused_lse():
     assert_close(got, want, dtype=q.dtype)
 
 
-# ---------------------------------------------------------------- jvp
+# ---------------------------------------------------------------- seqused
+#
+# seqused_q/seqused_k limit each slot to its first seqused[b] tokens (the
+# KV-cache case). Unused Q rows are unspecified on the kernels, so kernel
+# comparisons mask to the used rows; the reference yields zeros there.
+
+
+def used_rows(cu, su):
+    """Boolean (total,) mask of used token rows given slot offsets + used lens."""
+    cu, su = np.asarray(cu), np.asarray(su)
+    rows = np.zeros(cu[-1], bool)
+    for b in range(len(su)):
+        rows[cu[b] : cu[b] + su[b]] = True
+    return rows
+
+
+def seqused_case(slots, used_q, used_k, dtype=jnp.float32, h_q=2, h_kv=None, d=64, d_v=None, seed=0):
+    q, k, v, cu, _ = pack(slots, None, h_q=h_q, h_kv=h_kv, d=d, d_v=d_v, dtype=dtype, seed=seed)
+    return q, k, v, cu, jnp.asarray(used_q, jnp.int32), jnp.asarray(used_k, jnp.int32)
+
+
+def loop_oracle_seqused(q, k, v, cu, su_q, su_k, **kw):
+    """Dense reference per sequence over the *used* regions, scattered back
+    into zero-filled slots (matching the reference's unused-row convention)."""
+    h, d_v = q.shape[1], v.shape[2]
+    cu_, suq_, suk_ = np.asarray(cu), np.asarray(su_q), np.asarray(su_k)
+    outs, lses = [], []
+    for b in range(len(suq_)):
+        slot = cu_[b + 1] - cu_[b]
+        out_b = jnp.zeros((slot, h, d_v), q.dtype)
+        lse_b = jnp.full((h, slot), -jnp.inf, jnp.float32)
+        if suq_[b] > 0:
+            s = cu_[b]
+            qs = q[s : s + suq_[b]][None]
+            if suk_[b] > 0:
+                o, l = reference_attn(
+                    qs, k[s : s + suk_[b]][None], v[s : s + suk_[b]][None],
+                    return_lse=True, **kw,
+                )
+                out_b = out_b.at[: suq_[b]].set(o[0])
+                lse_b = lse_b.at[:, : suq_[b]].set(l[0])
+        outs.append(out_b)
+        lses.append(lse_b)
+    return jnp.concatenate(outs, 0), jnp.concatenate(lses, -1)
+
+
+SEQUSED_CASE = ([64, 128, 96], [50, 128, 1], [30, 100, 96])
+
+
+@pytest.mark.parametrize("kw", MASKING, ids=["plain", "causal", "window"])
+def test_reference_seqused_matches_loop(kw):
+    q, k, v, cu, su_q, su_k = seqused_case(*SEQUSED_CASE)
+    out, lse = reference_attn_varlen(
+        q, k, v, cu, cu, seqused_q=su_q, seqused_k=su_k, return_lse=True, **kw
+    )
+    want, want_lse = loop_oracle_seqused(q, k, v, cu, su_q, su_k, **kw)
+    assert_close(out, want, dtype=jnp.float32)
+    np.testing.assert_allclose(np.asarray(lse), np.asarray(want_lse), atol=1e-5, rtol=1e-5)
+
+
+def test_reference_seqused_k_only_cache_style():
+    """Decode against partially-filled caches: 1 used query per slot, K slots
+    used to varying degrees; causal aligns on the used lengths."""
+    slots_q, slots_k = [8, 8, 8], [128, 128, 128]
+    rng = np.random.default_rng(4)
+    q = jnp.asarray(rng.standard_normal((24, 2, 64)), jnp.float32)
+    k = jnp.asarray(rng.standard_normal((384, 2, 64)), jnp.float32)
+    v = jnp.asarray(rng.standard_normal((384, 2, 64)), jnp.float32)
+    cu_q, cu_k = cu_from(slots_q), cu_from(slots_k)
+    su_q = jnp.asarray([1, 1, 1], jnp.int32)
+    su_k = jnp.asarray([77, 0, 128], jnp.int32)
+    out = reference_attn_varlen(
+        q, k, v, cu_q, cu_k, seqused_q=su_q, seqused_k=su_k, causal=True
+    )
+    for b, (sq, sk) in enumerate(zip([1, 1, 1], [77, 0, 128])):
+        oq, ok = 8 * b, 128 * b
+        if sk == 0:
+            want_b = jnp.zeros((1, 2, 64), jnp.float32)
+        else:
+            want_b = reference_attn(
+                q[oq : oq + 1][None], k[ok : ok + sk][None], v[ok : ok + sk][None],
+                causal=True,
+            )[0]
+        assert_close(out[oq : oq + 1], want_b, dtype=jnp.float32, msg=f"seq {b}")
+        assert (np.asarray(out[oq + 1 : oq + 8]) == 0).all()  # unused q rows
+
+
+def test_seqused_validation():
+    q, k, v, cu, su_q, su_k = seqused_case(*SEQUSED_CASE)
+    with pytest.raises(ValueError, match="batch"):
+        flash_attn_varlen(q, k, v, cu, cu, seqused_q=su_q[:2])
+    with pytest.raises(TypeError, match="integer"):
+        flash_attn_varlen(q, k, v, cu, cu, seqused_k=su_k.astype(jnp.float32))
+
+
+def test_wiring_seqused_grad_and_jvp():
+    q, k, v, cu, su_q, su_k = seqused_case(*SEQUSED_CASE, seed=21)
+    kw = dict(seqused_q=su_q, seqused_k=su_k, causal=True)
+    prim = lambda q, k, v: flash_attn_varlen(q, k, v, cu, cu, backend="reference", **kw).sum()
+    direct = lambda q, k, v: reference_attn_varlen(q, k, v, cu, cu, **kw).sum()
+    got = jax.grad(prim, argnums=(0, 1, 2))(q, k, v)
+    want = jax.grad(direct, argnums=(0, 1, 2))(q, k, v)
+    for g, w, name in zip(got, want, "qkv"):
+        assert_close(g, w, dtype=jnp.float32, msg=f"d{name}")
+    rng = np.random.default_rng(22)
+    tangents = tuple(jnp.asarray(rng.standard_normal(a.shape), a.dtype) for a in (q, k, v))
+    _, t_got = jax.jvp(prim, (q, k, v), tangents)
+    _, t_want = jax.jvp(direct, (q, k, v), tangents)
+    assert_close(t_got, t_want, dtype=jnp.float32)
+
+
+def _masked(x, rows):
+    return jnp.where(jnp.asarray(rows)[:, None, None], x.astype(jnp.float32), 0.0)
 
 
 @cuda
-def test_jvp_raises_on_cute_works_on_reference():
+@pytest.mark.parametrize("kw", MASKING, ids=["plain", "causal", "window"])
+def test_fwd_seqused(kw):
+    q, k, v, cu, su_q, su_k = seqused_case(*SEQUSED_CASE, dtype=jnp.bfloat16)
+    got, lse_got = flash_attn_varlen(
+        q, k, v, cu, cu, seqused_q=su_q, seqused_k=su_k,
+        return_lse=True, backend="cute", **kw,
+    )
+    want, lse_want = flash_attn_varlen(
+        q, k, v, cu, cu, seqused_q=su_q, seqused_k=su_k,
+        return_lse=True, backend="reference", **kw,
+    )
+    rows = used_rows(cu, su_q)
+    assert_close(_masked(got, rows), _masked(want, rows), dtype=q.dtype)
+    assert_close(
+        jnp.where(jnp.asarray(rows)[None], lse_got, 0.0),
+        jnp.where(jnp.asarray(rows)[None], lse_want, 0.0),
+        atol=1e-3, rtol=1e-3,
+    )
+
+
+@cuda
+def test_fwd_seqused_k_only_cache_style():
+    """Partially-filled KV caches on the kernels, decode-style."""
+    rng = np.random.default_rng(4)
+    q = jnp.asarray(rng.standard_normal((3, 2, 64)), jnp.bfloat16)
+    kv_shape = (384, 2, 64)
+    k = jnp.asarray(rng.standard_normal(kv_shape), jnp.bfloat16)
+    v = jnp.asarray(rng.standard_normal(kv_shape), jnp.bfloat16)
+    cu_q, cu_k = cu_from([1, 1, 1]), cu_from([128, 128, 128])
+    su_k = jnp.asarray([77, 0, 128], jnp.int32)
+    kw = dict(seqused_k=su_k, causal=True)
+    got = flash_attn_varlen(q, k, v, cu_q, cu_k, backend="cute", **kw)
+    want = flash_attn_varlen(q, k, v, cu_q, cu_k, backend="reference", **kw)
+    assert_close(got, want, dtype=q.dtype)
+
+
+@cuda
+@pytest.mark.parametrize(
+    "h_kv,gqa,d_v",
+    [(2, 1, None), (2, 2, None), (2, 2, 32)],
+    ids=["mha", "gqa", "gqa-mixed"],
+)
+def test_grad_seqused(h_kv, gqa, d_v):
+    """Backward with used-length overrides, including the fp32-accumulator
+    GQA paths; gradients compared on used rows (dq via seqused_q, dk/dv via
+    seqused_k), unused rows are unspecified."""
+    q, k, v, cu, su_q, su_k = seqused_case(
+        *SEQUSED_CASE, dtype=jnp.bfloat16, h_q=h_kv * gqa, h_kv=h_kv, d_v=d_v, seed=7
+    )
+    kw = dict(seqused_q=su_q, seqused_k=su_k, causal=True)
+
+    def loss(be):
+        return lambda q, k, v: flash_attn_varlen(q, k, v, cu, cu, backend=be, **kw).sum()
+
+    got = jax.grad(loss("cute"), argnums=(0, 1, 2))(q, k, v)
+    want = jax.grad(loss("reference"), argnums=(0, 1, 2))(q, k, v)
+    rows_q, rows_k = used_rows(cu, su_q), used_rows(cu, su_k)
+    for g, w, name, rows in zip(got, want, "qkv", (rows_q, rows_k, rows_k)):
+        assert_close(_masked(g, rows), _masked(w, rows), dtype=q.dtype, msg=f"d{name}")
+
+
+@cuda
+def test_seqused_full_slots_matches_plain_varlen():
+    """Explicit seqused equal to the slot sizes is exactly the plain varlen
+    call (they bind identical operands)."""
     q, k, v, cu_q, cu_k = pack([37, 91], dtype=jnp.bfloat16)
-    rng = np.random.default_rng(5)
+    su = cu_q[1:] - cu_q[:-1]
+    a = flash_attn_varlen(q, k, v, cu_q, cu_k, seqused_q=su, seqused_k=su, backend="cute")
+    b = flash_attn_varlen(q, k, v, cu_q, cu_k, backend="cute")
+    assert_close(a, b, atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------- jvp
+
+
+def _jvp_pair(q, k, v, cu_q, cu_k, seed=5, **kw):
+    rng = np.random.default_rng(seed)
     tangents = tuple(jnp.asarray(rng.standard_normal(t.shape), t.dtype) for t in (q, k, v))
-    f = lambda be: lambda q, k, v: flash_attn_varlen(q, k, v, cu_q, cu_k, backend=be)
-    with pytest.raises(NotImplementedError, match="varlen"):
-        jax.jvp(f("cute"), (q, k, v), tangents)
-    _, t_ref = jax.jvp(f("reference"), (q, k, v), tangents)
-    assert np.isfinite(np.asarray(t_ref, np.float32)).all()
+    f = lambda be: lambda q, k, v: flash_attn_varlen(q, k, v, cu_q, cu_k, backend=be, **kw)
+    _, t_got = jax.jvp(f("cute"), (q, k, v), tangents)
+    _, t_want = jax.jvp(f("reference"), (q, k, v), tangents)
+    return t_got, t_want
+
+
+@cuda
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("lens_q,lens_k", LENS_ARGS, ids=LENS_IDS)
+def test_jvp(lens_q, lens_k, causal):
+    """The varlen tangent kernel against the reference JVP."""
+    q, k, v, cu_q, cu_k = pack(lens_q, lens_k, dtype=jnp.bfloat16)
+    t_got, t_want = _jvp_pair(q, k, v, cu_q, cu_k, causal=causal)
+    assert_close(t_got, t_want, dtype=q.dtype)
+
+
+@cuda
+@pytest.mark.parametrize("masking", ["window", "mask_mod"])
+def test_jvp_masking(masking):
+    q, k, v, cu_q, cu_k = pack([40, 64, 24], dtype=jnp.bfloat16)
+    kw = (
+        dict(window_size=(24, 8))
+        if masking == "window"
+        else dict(mask_mod=_PrefixMask(jnp.asarray([10, 50, 5], jnp.int32)))
+    )
+    t_got, t_want = _jvp_pair(q, k, v, cu_q, cu_k, **kw)
+    assert_close(t_got, t_want, dtype=q.dtype)
+
+
+@cuda
+@pytest.mark.parametrize("gqa,d_v", [(2, None), (2, 32)], ids=["gqa", "gqa-mixed"])
+def test_jvp_gqa(gqa, d_v):
+    q, k, v, cu_q, cu_k = pack([200, 88], h_q=2 * gqa, h_kv=2, d_v=d_v, dtype=jnp.bfloat16)
+    t_got, t_want = _jvp_pair(q, k, v, cu_q, cu_k, causal=True)
+    assert_close(t_got, t_want, dtype=q.dtype)
+
+
+@cuda
+def test_jvp_seqused():
+    q, k, v, cu, su_q, su_k = seqused_case(*SEQUSED_CASE, dtype=jnp.bfloat16, seed=9)
+    t_got, t_want = _jvp_pair(
+        q, k, v, cu, cu, causal=True, seqused_q=su_q, seqused_k=su_k
+    )
+    rows = used_rows(cu, su_q)
+    assert_close(_masked(t_got, rows), _masked(t_want, rows), dtype=q.dtype)
+
+
+@cuda
+def test_jvp_lse_tangent():
+    """t_lse = mu from the varlen tangent kernel's second output, (h, total_q)."""
+    q, k, v, cu_q, cu_k = pack([37, 91], dtype=jnp.bfloat16)
+    rng = np.random.default_rng(6)
+    tangents = tuple(jnp.asarray(rng.standard_normal(t.shape), t.dtype) for t in (q, k, v))
+    f = lambda be: lambda q, k, v: flash_attn_varlen(
+        q, k, v, cu_q, cu_k, causal=True, return_lse=True, backend=be
+    )[1]
+    _, mu_got = jax.jvp(f("cute"), (q, k, v), tangents)
+    _, mu_want = jax.jvp(f("reference"), (q, k, v), tangents)
+    assert_close(mu_got, mu_want, atol=5e-3, rtol=5e-3)
 
 
 # ---------------------------------------------------------------- jit / caching

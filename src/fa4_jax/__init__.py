@@ -7,8 +7,9 @@ Public surface:
   kernel) differentiation.
 - ``flash_attn_varlen`` — the same over packed variable-length batches:
   ``(total_tokens, heads, head_dim)`` tensors delimited by int32
-  ``cu_seqlens`` offset arrays, no padding. Reverse mode runs the FA4 varlen
-  backward kernels; forward mode is reference-backend only for now.
+  ``cu_seqlens`` offset arrays (plus optional ``seqused`` used-length
+  overrides for partially-filled slots), no padding. Both differentiation
+  modes run on the kernels, like ``flash_attn``.
 - ``MaskMod`` (a callable-pytree base class: array fields are runtime data,
   ``static()`` fields are compile-time) and the masks/combinators in
   ``fa4_jax.masks`` — flex-attention style mask mods that run both as CuTe
@@ -21,7 +22,7 @@ cutejax) load lazily on first GPU-backend call, so the reference backend and
 the unit tests work on machines with no GPU stack at all.
 """
 
-from fa4_jax.attention import flash_attn, flash_attn_varlen
+from fa4_jax.attention import default_kernel_arch, flash_attn, flash_attn_varlen
 from fa4_jax.masks import (
     FnMask,
     MaskMod,
@@ -39,6 +40,7 @@ __all__ = [
     "MaskMod",
     "and_masks",
     "causal_mask",
+    "default_kernel_arch",
     "document_mask",
     "flash_attn",
     "flash_attn_varlen",

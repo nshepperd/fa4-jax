@@ -26,7 +26,7 @@ override-dependencies = ["nvidia-cutlass-dsl>=4.7"]
 [dependency-groups]
 dev = [
     "pytest>=8",
-    "cutejax @ git+https://github.com/nshepperd/cutejax"
+    "cutejax[redis] @ git+https://github.com/nshepperd/cutejax"
 ]
 
 [build-system]

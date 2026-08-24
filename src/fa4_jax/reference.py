@@ -132,6 +132,8 @@ def varlen_dense_mask(
     causal: bool,
     window: tuple[int | None, int | None],
     mask_mod: MaskMod | None,
+    seqused_q: Array | None = None,
+    seqused_k: Array | None = None,
 ) -> Bool[Array, "heads total_q total_k"]:
     """The dense visibility mask for packed varlen attention.
 
@@ -141,6 +143,11 @@ def varlen_dense_mask(
     ``mask_mod`` sees the sequence index as ``b`` and **sequence-local**
     ``q_idx``/``kv_idx`` — the same convention as the CuTe kernels, whose
     tiles are addressed relative to each sequence's start.
+
+    ``seqused_q``/``seqused_k`` (int ``(batch,)``) override the *used* length
+    of each slot: only the first ``seqused[b]`` tokens of sequence ``b``
+    participate (queries beyond it get all-masked rows, keys beyond it are
+    invisible), and the alignment above uses the used lengths.
     """
     iq = jnp.arange(total_q)
     ik = jnp.arange(total_k)
@@ -151,11 +158,23 @@ def varlen_dense_mask(
     seg_k = jnp.searchsorted(cu_seqlens_k, ik, side="right") - 1
     q_local = iq - cu_seqlens_q[seg_q]
     k_local = ik - cu_seqlens_k[seg_k]
-    len_q = cu_seqlens_q[seg_q + 1] - cu_seqlens_q[seg_q]
-    len_k = cu_seqlens_k[seg_q + 1] - cu_seqlens_k[seg_q]  # K length of q's sequence
+    len_q = (
+        seqused_q[seg_q]
+        if seqused_q is not None
+        else cu_seqlens_q[seg_q + 1] - cu_seqlens_q[seg_q]
+    )
+    len_k = (  # K length of q's sequence
+        seqused_k[seg_q]
+        if seqused_k is not None
+        else cu_seqlens_k[seg_q + 1] - cu_seqlens_k[seg_q]
+    )
     q_pos = q_local + (len_k - len_q)  # the query's position on its key axis
 
     mask = seg_q[:, None] == seg_k[None, :]
+    if seqused_q is not None:
+        mask = mask & (q_local < len_q)[:, None]
+    if seqused_k is not None:
+        mask = mask & (k_local < seqused_k[seg_k])[None, :]
     if causal:
         mask = mask & (k_local[None, :] <= q_pos[:, None])
     left, right = window
@@ -172,7 +191,8 @@ def varlen_dense_mask(
 
 
 def varlen_fwd_lse(
-    q, k, v, cu_seqlens_q, cu_seqlens_k, scale: float, causal: bool, window, mask_mod
+    q, k, v, cu_seqlens_q, cu_seqlens_k, scale: float, causal: bool, window, mask_mod,
+    seqused_q=None, seqused_k=None,
 ):
     """Packed-varlen ``(out, lse)`` in float32 from float32 inputs.
 
@@ -183,7 +203,8 @@ def varlen_fwd_lse(
     total_q, h, d = q.shape
     total_k, d_v = k.shape[0], v.shape[2]
     full = varlen_dense_mask(
-        h, cu_seqlens_q, cu_seqlens_k, total_q, total_k, causal, window, mask_mod
+        h, cu_seqlens_q, cu_seqlens_k, total_q, total_k, causal, window, mask_mod,
+        seqused_q=seqused_q, seqused_k=seqused_k,
     )
 
     dd = max(d, d_v)
@@ -208,6 +229,8 @@ def reference_attn_varlen(
     cu_seqlens_q,
     cu_seqlens_k,
     *,
+    seqused_q=None,
+    seqused_k=None,
     causal: bool = False,
     window_size: tuple[int | None, int | None] | None = None,
     scale: float | None = None,
@@ -217,7 +240,8 @@ def reference_attn_varlen(
     """Reference varlen attention with the semantics of ``flash_attn_varlen``.
 
     Differentiable by ordinary JAX autodiff; the oracle the varlen kernels
-    are tested against.
+    are tested against. Unused slot tails (beyond ``seqused``) come out as
+    zeros with ``lse = -inf`` here; the kernels leave them unspecified.
     """
     scale = float(scale if scale is not None else 1.0 / math.sqrt(q.shape[-1]))
     window = window_size if window_size is not None else (None, None)
@@ -225,6 +249,7 @@ def reference_attn_varlen(
     out, lse = varlen_fwd_lse(
         q.astype(f32), k.astype(f32), v.astype(f32),
         cu_seqlens_q, cu_seqlens_k, scale, causal, window, mask_mod,
+        seqused_q=seqused_q, seqused_k=seqused_k,
     )
     out = out.astype(q.dtype)
     return (out, lse) if return_lse else out

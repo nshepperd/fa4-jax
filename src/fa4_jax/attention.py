@@ -27,15 +27,18 @@ reference, and the kernels are checked against the reference.
 
 ``flash_attn_varlen`` shares the same three primitives: ``cfg.varlen``
 switches the operand layout to packed ``(total_tokens, heads, head_dim)``
-q/k/v followed by two int32 ``cu_seqlens`` operands (which differentiation
-treats as data: integer tangents are symbolic zeros, transposes return no
-cotangent for them).
+q/k/v followed by four int32 seqlen operands — cu_seqlens_q, cu_seqlens_k,
+seqused_q, seqused_k, the last two synthesized as the slot sizes when the
+caller does not pass them, so the operand count stays fixed — which
+differentiation treats as data: integer tangents are symbolic zeros,
+transposes return no cotangent for them.
 """
 
 from __future__ import annotations
 
 import functools
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -47,7 +50,55 @@ from jaxtyping import Array, Float
 
 from fa4_jax.masks import MaskMod
 
-__all__ = ["flash_attn", "flash_attn_varlen"]
+__all__ = ["default_kernel_arch", "flash_attn", "flash_attn_varlen"]
+
+
+# ---------------------------------------------------------------- kernel families
+
+# Ambient default for the per-call `kernel_arch` argument (explicit argument
+# wins). Process-global: meant for tests and benchmarks that want every call
+# in a region to use one kernel family without threading the parameter.
+_DEFAULT_KERNEL_ARCH: int | None = None
+
+
+@contextmanager
+def default_kernel_arch(arch: int | None):
+    """Scope a default for ``kernel_arch``: every ``flash_attn`` /
+    ``flash_attn_varlen`` call inside behaves as if ``kernel_arch=arch`` was
+    passed (calls that pass it explicitly are unaffected). Not thread-safe.
+    """
+    global _DEFAULT_KERNEL_ARCH
+    prev = _DEFAULT_KERNEL_ARCH
+    _DEFAULT_KERNEL_ARCH = None if arch is None else int(arch)
+    try:
+        yield
+    finally:
+        _DEFAULT_KERNEL_ARCH = prev
+
+
+def kernel_arch_unsupported(arch: int, device_arch: int) -> str | None:
+    """Why kernel family ``arch`` cannot execute on ``sm_{device_arch}``, or
+    None if it can. The single source of truth for the runtime validation in
+    the cute backend and the test suite's per-family skip logic.
+
+    A family is the *implementation* (instruction mix, schedules, tiles);
+    code is always compiled for the real device, so a family can serve
+    newer hardware when its instructions exist there: the SM80-MMA kernels
+    (cp.async + mma.sync, and tile configs that fit the smallest 99 KB SMEM
+    budget) run on sm_8x, sm_10x/11x, and sm_12x alike; the tcgen05 kernels
+    need datacenter Blackwell.
+    """
+    if arch // 10 == 9:
+        return "the SM90 (Hopper) kernels are not vendored"
+    if arch // 10 in (10, 11):
+        if device_arch // 10 not in (10, 11):
+            return "the tcgen05 kernels need a datacenter-Blackwell (sm_10x) device"
+        return None
+    if arch // 10 in (8, 12):
+        if device_arch // 10 not in (8, 10, 11, 12):
+            return f"the SM80-MMA kernel family is not supported on sm_{device_arch}"
+        return None
+    return "unknown kernel family (expected one of 8x, 90, 10x, 12x)"
 
 
 @dataclass(frozen=True)
@@ -60,9 +111,9 @@ class AttnConfig:
     and ``mask.unflatten(aux)`` rebuilds the callable inside a backend.
 
     ``varlen`` switches the primitives to the packed layout: q/k/v are
-    ``(total_tokens, heads, head_dim)`` and two extra ``cu_seqlens`` operands
-    (int32 ``(batch+1,)`` cumulative offsets) follow q/k/v in the operand
-    lists.
+    ``(total_tokens, heads, head_dim)`` and four extra int32 seqlen operands
+    (cu_seqlens_q/k cumulative offsets, seqused_q/k used lengths) follow
+    q/k/v in the operand lists.
     """
 
     causal: bool
@@ -72,6 +123,9 @@ class AttnConfig:
     mask: jax.tree_util.PyTreeDef | None
     backend: str
     varlen: bool = False
+    # Kernel-family override for the cute backend (e.g. 80 to run the
+    # SM80-MMA kernels on newer hardware); None = follow the device.
+    kernel_arch: int | None = None
 
     @property
     def n_aux(self) -> int:
@@ -85,8 +139,9 @@ class AttnConfig:
 class Backend(Protocol):
     """The four array-level ops a backend provides. All take/return jax arrays.
 
-    ``seqlens`` is ``None`` for the batched layout, or the
-    ``(cu_seqlens_q, cu_seqlens_k)`` pair for the packed varlen layout.
+    ``seqlens`` is ``None`` for the batched layout, or the varlen 4-tuple
+    ``(cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)`` — all always
+    present in varlen mode (seqused defaults to the slot sizes).
     """
 
     def fwd(self, cfg: AttnConfig, q, k, v, aux, seqlens=None) -> Array: ...
@@ -144,10 +199,11 @@ def _lse_struct(q, cfg: AttnConfig):
 
 def _fwd_split(cfg: AttnConfig, args):
     """``fa4_fwd`` operands -> (q, k, v, seqlens, aux); seqlens is the
-    (cu_seqlens_q, cu_seqlens_k) pair when ``cfg.varlen`` else None."""
+    (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k) 4-tuple when
+    ``cfg.varlen`` else None."""
     if cfg.varlen:
-        q, k, v, cu_q, cu_k, *aux = args
-        return q, k, v, (cu_q, cu_k), tuple(aux)
+        q, k, v, cu_q, cu_k, su_q, su_k, *aux = args
+        return q, k, v, (cu_q, cu_k, su_q, su_k), tuple(aux)
     q, k, v, *aux = args
     return q, k, v, None, tuple(aux)
 
@@ -197,8 +253,8 @@ mlir.register_lowering(fa4_fwd_p, mlir.lower_fun(_fwd_impl, multiple_results=Tru
 def _tangent_split(cfg: AttnConfig, args):
     q, k, v, out, lse, dq, dk, dv, *rest = args
     if cfg.varlen:
-        cu_q, cu_k, *aux = rest
-        return q, k, v, out, lse, dq, dk, dv, (cu_q, cu_k), tuple(aux)
+        cu_q, cu_k, su_q, su_k, *aux = rest
+        return q, k, v, out, lse, dq, dk, dv, (cu_q, cu_k, su_q, su_k), tuple(aux)
     return q, k, v, out, lse, dq, dk, dv, None, tuple(rest)
 
 
@@ -258,8 +314,8 @@ def _vjp_split(cfg, args, has_d_lse):
     q, k, v, out, lse, d_out, *rest = args
     d_lse, rest = (rest[0], rest[1:]) if has_d_lse else (None, rest)
     if cfg.varlen:
-        cu_q, cu_k, *aux = rest
-        return q, k, v, out, lse, d_out, d_lse, (cu_q, cu_k), tuple(aux)
+        cu_q, cu_k, su_q, su_k, *aux = rest
+        return q, k, v, out, lse, d_out, d_lse, (cu_q, cu_k, su_q, su_k), tuple(aux)
     return q, k, v, out, lse, d_out, d_lse, None, tuple(rest)
 
 
@@ -408,13 +464,15 @@ def _check_qkv(q, k, v):
         )
 
 
-def _make_config(q, causal, window_size, scale, mask_def, backend, varlen):
+def _make_config(q, causal, window_size, scale, mask_def, backend, varlen, kernel_arch):
     left, right = window_size if window_size is not None else (None, None)
     causal, local, wl, wr = _resolve_causal_local_window(
         causal,
         None if left is None else int(left),
         None if right is None else int(right),
     )
+    if kernel_arch is None:
+        kernel_arch = _DEFAULT_KERNEL_ARCH
     return AttnConfig(
         causal=causal,
         local=local,
@@ -423,6 +481,7 @@ def _make_config(q, causal, window_size, scale, mask_def, backend, varlen):
         mask=mask_def,
         backend=backend if backend is not None else _default_backend(),
         varlen=varlen,
+        kernel_arch=None if kernel_arch is None else int(kernel_arch),
     )
 
 
@@ -437,6 +496,7 @@ def flash_attn(
     mask_mod: MaskMod | None = None,
     return_lse: bool = False,
     backend: str | None = None,
+    kernel_arch: int | None = None,
 ):
     """FlashAttention-4 with reverse- and forward-mode differentiation.
 
@@ -470,6 +530,16 @@ def flash_attn(
             (float32, natural log; ``-inf`` for rows with no visible key).
         backend: ``"cute"`` (FA4 kernels, CUDA), ``"reference"`` (plain jnp),
             or None to pick cute exactly when jax is running on GPU.
+        kernel_arch: override which kernel *family* the cute backend uses,
+            as a compute capability (e.g. ``80`` for the SM80-MMA kernels,
+            ``120`` for their SM120 variant, ``100`` for tcgen05); ``None``
+            follows the ambient :func:`default_kernel_arch` scope if one is
+            active, else the device. Code is still compiled for the real
+            device — this only selects the implementation, which must be
+            executable there (the SM80/SM120 families run on
+            sm_8x/sm_100/sm_120; tcgen05 needs sm_100). The reference
+            backend ignores it. Used by the test suite to cover every
+            runnable family; also an escape hatch if one family misbehaves.
 
     Returns:
         ``(batch, q_seq, q_heads, head_dim_v)`` in q's dtype, plus the LSE if
@@ -481,7 +551,7 @@ def flash_attn(
         raise ValueError(f"batch mismatch: q {q.shape[0]} vs kv {k.shape[0]}")
     _check_qkv(q, k, v)
     aux_tensors, mask_def = _flatten_mask(mask_mod)
-    cfg = _make_config(q, causal, window_size, scale, mask_def, backend, varlen=False)
+    cfg = _make_config(q, causal, window_size, scale, mask_def, backend, varlen=False, kernel_arch=kernel_arch)
     res = fa4_fwd_p.bind(q, k, v, *aux_tensors, cfg=cfg, need_lse=return_lse)
     return (res[0], res[1]) if return_lse else res[0]
 
@@ -493,12 +563,15 @@ def flash_attn_varlen(
     cu_seqlens_q,
     cu_seqlens_k,
     *,
+    seqused_q=None,
+    seqused_k=None,
     causal: bool = False,
     window_size: tuple[int | None, int | None] | None = None,
     scale: float | None = None,
     mask_mod: MaskMod | None = None,
     return_lse: bool = False,
     backend: str | None = None,
+    kernel_arch: int | None = None,
 ):
     """Variable-length (packed / ragged) FlashAttention-4.
 
@@ -519,6 +592,15 @@ def flash_attn_varlen(
             unspecified values in the outputs and their gradients).
             Zero-length sequences (repeated offsets) are fine.
         cu_seqlens_k: same for k/v; must have the same ``batch``.
+        seqused_q, seqused_k: optional int32 ``(batch,)`` *used* lengths.
+            When given, only the first ``seqused[b]`` tokens of slot ``b``
+            participate: on the K side the rest of the slot is invisible (the
+            KV-cache case — slots allocated larger than currently filled); on
+            the Q side the rest produces no output (those rows of the result
+            and its gradients are unspecified, like uncovered tokens).
+            ``causal``/``window_size`` align on the *used* lengths. Must
+            satisfy ``0 <= seqused[b] <= cu[b+1] - cu[b]`` (runtime data, not
+            checked). Default: the full slot, ``cu[1:] - cu[:-1]``.
         causal, window_size: as in :func:`flash_attn`, applied **per
             sequence** and bottom-right aligned within it: query ``i`` of
             sequence ``b`` sits at key position ``i + (len_k_b - len_q_b)``.
@@ -530,15 +612,15 @@ def flash_attn_varlen(
             ``(q_heads, total_q)`` (float32, natural log, ``-inf`` for rows
             with no visible key).
         backend: as in :func:`flash_attn`.
+        kernel_arch: as in :func:`flash_attn`.
 
     Returns:
         ``(total_q, q_heads, head_dim_v)`` in q's dtype, plus the LSE if
         ``return_lse``.
 
-    Differentiation: reverse mode runs the FA4 varlen backward kernels;
-    forward mode (``jax.jvp``) is currently reference-backend only — the
-    fused tangent kernel does not take the packed layout yet. ``vmap`` over
-    a varlen call is not supported (the packing *is* the batch).
+    Differentiation: reverse mode runs the FA4 varlen backward kernels and
+    forward mode (``jax.jvp``) the fused varlen tangent kernel. ``vmap``
+    over a varlen call is not supported (the packing *is* the batch).
     """
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
         raise ValueError(
@@ -563,10 +645,31 @@ def flash_attn_varlen(
         )
     cu_seqlens_q = cu_seqlens_q.astype(jnp.int32)
     cu_seqlens_k = cu_seqlens_k.astype(jnp.int32)
+    batch = cu_seqlens_q.shape[0] - 1
+    # The primitives always carry both seqused operands so the operand count
+    # (and the compiled kernel variant) is fixed: a full slot is the same as
+    # no override.
+    seqused = []
+    for name, su, cu in (
+        ("seqused_q", seqused_q, cu_seqlens_q),
+        ("seqused_k", seqused_k, cu_seqlens_k),
+    ):
+        if su is None:
+            seqused.append(cu[1:] - cu[:-1])
+            continue
+        su = jnp.asarray(su)
+        if su.ndim != 1 or su.shape[0] != batch:
+            raise ValueError(
+                f"{name} must be a 1D (batch,) array matching cu_seqlens "
+                f"(batch={batch}), got shape {su.shape}"
+            )
+        if not jnp.issubdtype(su.dtype, jnp.integer):
+            raise TypeError(f"{name} must be an integer array, got {su.dtype}")
+        seqused.append(su.astype(jnp.int32))
     aux_tensors, mask_def = _flatten_mask(mask_mod)
-    cfg = _make_config(q, causal, window_size, scale, mask_def, backend, varlen=True)
+    cfg = _make_config(q, causal, window_size, scale, mask_def, backend, varlen=True, kernel_arch=kernel_arch)
     res = fa4_fwd_p.bind(
-        q, k, v, cu_seqlens_q, cu_seqlens_k, *aux_tensors,
+        q, k, v, cu_seqlens_q, cu_seqlens_k, *seqused, *aux_tensors,
         cfg=cfg, need_lse=return_lse,
     )
     return (res[0], res[1]) if return_lse else res[0]

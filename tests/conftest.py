@@ -41,6 +41,74 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip)
 
 
+# ---------------------------------------------------------------- kernel families
+#
+# Every cuda-marked test fans out over the vendored kernel families
+# (sm80/sm90/sm100/sm120 parametrizations) and runs each one the device can
+# actually execute, through the public selection mechanism: the fixture
+# scopes fa4_jax.default_kernel_arch(...) around the test, so every call
+# behaves as if the user passed kernel_arch=<family>. The rest appear as
+# skips, so reports show exactly which implementations have coverage — the
+# SM80-MMA kernels run fine on a B200, and several real varlen bugs lived
+# only in that family. Codegen still targets the real device; only the
+# kernel implementation is selected. The runnable/skip matrix is
+# fa4_jax.attention.kernel_arch_unsupported — the same check the backend
+# applies to user-supplied kernel_arch values.
+#
+# FA4_TEST_ARCHS=sm100,sm80 (or "80,100") restricts the sweep for quick runs.
+
+KERNEL_ARCHS = (80, 90, 100, 120)
+
+
+def _real_arch() -> int:
+    cap = getattr(jax.devices()[0], "compute_capability", "0.0")
+    major, _, minor = str(cap).partition(".")
+    return int(major) * 10 + int(minor or 0)
+
+
+def _selected_archs():
+    spec = os.environ.get("FA4_TEST_ARCHS")
+    if not spec:
+        return KERNEL_ARCHS
+    picked = tuple(int(a.strip().removeprefix("sm")) for a in spec.split(","))
+    bad = [a for a in picked if a not in KERNEL_ARCHS]
+    if bad:
+        raise ValueError(f"FA4_TEST_ARCHS: unknown arch(s) {bad}; known: {KERNEL_ARCHS}")
+    return picked
+
+
+def pytest_generate_tests(metafunc):
+    if "kernel_arch" in metafunc.fixturenames and metafunc.definition.get_closest_marker(
+        "cuda"
+    ):
+        archs = _selected_archs()
+        metafunc.parametrize(
+            "kernel_arch", archs, ids=[f"sm{a}" for a in archs], indirect=True
+        )
+
+
+@pytest.fixture(autouse=True)
+def kernel_arch(request):
+    """Scope one kernel family around each cuda-marked test via the public
+    ``fa4_jax.default_kernel_arch`` mechanism (explicit ``kernel_arch=``
+    arguments in a test still win, as for any user). Unparametrized
+    (non-cuda) tests get the native path untouched.
+    """
+    arch = getattr(request, "param", None)
+    if arch is None or not has_cuda():
+        yield None
+        return
+    from fa4_jax.attention import kernel_arch_unsupported
+
+    reason = kernel_arch_unsupported(arch, _real_arch())
+    if reason is not None:
+        pytest.skip(f"kernel family sm{arch}: {reason}")
+    import fa4_jax
+
+    with fa4_jax.default_kernel_arch(arch):
+        yield arch
+
+
 TOL = {
     jnp.dtype(jnp.float32): dict(atol=2e-5, rtol=2e-5),
     # Flat tolerances, calibrated for the suite's unit-variance inputs (scale

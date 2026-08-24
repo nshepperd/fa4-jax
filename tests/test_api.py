@@ -80,12 +80,20 @@ def test_rejects_f32_on_cute():
 
 
 @pytest.mark.cuda
-def test_rejects_unsupported_head_dim_on_cute():
-    """head_dim 256 does not fit the SM80/SM120 tile budget; must be a clean
-    error, not a failed launch that poisons the CUDA context."""
+def test_unsupported_head_dim_never_poisons_context():
+    """head_dim 256: whether it fits is family- and device-dependent (the
+    sm80-family budget accommodates it on a B200; the tcgen05 wrapper and
+    sm120 budget reject it). The invariant is that flash_attn either raises
+    a clean ValueError or computes correctly — never a failed launch that
+    poisons the CUDA context."""
     q, k, v = random_qkv(np.random.default_rng(0), 1, 64, 64, 1, 1, 256, dtype=jnp.bfloat16)
-    with pytest.raises(ValueError, match="cannot run head_dim=256"):
-        flash_attn(q, k, v, backend="cute")
+    try:
+        got = flash_attn(q, k, v, backend="cute")
+    except ValueError as e:
+        assert "cannot run head_dim=256" in str(e)
+    else:
+        want = flash_attn(q, k, v, backend="reference")
+        assert_close(got, want, dtype=q.dtype)
     q, k, v = random_qkv(np.random.default_rng(0), 1, 64, 64, 1, 1, 20, dtype=jnp.bfloat16)
     with pytest.raises(ValueError, match="multiples of 8"):
         flash_attn(q, k, v, backend="cute")

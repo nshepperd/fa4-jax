@@ -18,14 +18,18 @@ from fa4_jax import reference as ref
 
 def _fwd(cfg, aux, seqlens=None):
     """The forward as a function of (q, k, v) alone; the mask's array leaves
-    and the varlen cu_seqlens (integer data, never differentiated) are closed
-    over (mask tangents are rejected by flash_attn's JVP rule)."""
+    and the varlen seqlen arrays (integer data, never differentiated) are
+    closed over (mask tangents are rejected by flash_attn's JVP rule).
+
+    ``seqlens`` is the varlen 4-tuple (cu_seqlens_q, cu_seqlens_k,
+    seqused_q, seqused_k) or None for the batched layout.
+    """
     f32 = jnp.float32
     mask_mod = cfg.mask_mod(aux)
 
     def f(q, k, v):
         if seqlens is not None:
-            cu_q, cu_k = seqlens
+            cu_q, cu_k, su_q, su_k = seqlens
             return ref.varlen_fwd_lse(
                 q.astype(f32),
                 k.astype(f32),
@@ -36,6 +40,8 @@ def _fwd(cfg, aux, seqlens=None):
                 cfg.causal,
                 cfg.window,
                 mask_mod,
+                seqused_q=su_q,
+                seqused_k=su_k,
             )
         return ref.fwd_lse(
             q.astype(f32),
