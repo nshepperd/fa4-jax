@@ -16,6 +16,7 @@ dependencies = [
 [project.optional-dependencies]
 # GPU runtime: jax with CUDA plus the CuTe DSL CUDA runtime libraries. CPU-only
 # installs (reference backend, unit tests) don't need either.
+cu12 = ["jax[cuda12]"]
 cu13 = ["jax[cuda13]", "nvidia-cutlass-dsl[cu13]>=4.7.0"]
 
 [tool.uv]
@@ -26,8 +27,21 @@ override-dependencies = ["nvidia-cutlass-dsl>=4.7"]
 [dependency-groups]
 dev = [
     "pytest>=8",
-    "cutejax[redis] @ git+https://github.com/nshepperd/cutejax"
+    "cutejax[redis] @ git+https://github.com/nshepperd/cutejax",
+    # Local testing only: pull the jax-tvm-ffi fork from its release index. The
+    # source is scoped to this group, so it isn't inherited when fa4-jax is
+    # consumed as a git/path dependency.
+    "jax-tvm-ffi",
 ]
+
+[tool.uv.sources]
+jax-tvm-ffi = { index = "jax-tvm-ffi-emily", group = "dev" }
+
+[[tool.uv.index]]
+name = "jax-tvm-ffi-emily"
+url = "https://github.com/nshepperd/jax-tvm-ffi/releases/download/emily-latest/index.html"
+format = "flat"
+explicit = true
 
 [build-system]
 build-backend = "hatchling.build"
