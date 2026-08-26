@@ -127,8 +127,12 @@ class FlashAttentionForwardBase:
         num_threads,
         is_causal,
         Q_in_regs=False,
+        smem_capacity=None,
     ) -> bool:
         """Check if the kernel can be implemented with the given parameters.
+
+        ``smem_capacity`` (bytes) defaults to sm_80's; subclasses for parts
+        with less shared memory pass their own.
 
         :param dtype: data type
         :type dtype: cutlass.Numeric
@@ -156,17 +160,23 @@ class FlashAttentionForwardBase:
             return False
         if num_threads % 32 != 0:
             return False
-        # Check if block size setting is out of shared memory capacity
-        # Shared memory usage: Q tile + (K tile + V tile) where K and V use the same tile size
-        smem_usage_Q = tile_m * head_dim * 2
-        smem_usage_K = tile_n * head_dim * num_stages * 2
-        smem_usage_V = tile_n * head_dim_v * num_stages * 2
+        # Check if block size setting is out of shared memory capacity.
+        # Mirrors _get_shared_storage_cls: Q/K/V tiles over the 16-padded head
+        # dims (see __init__), each a 1024-aligned MemRange.
+        def round_up(x, to):
+            return -(-x // to) * to
+
+        width = dtype.width // 8
+        hd, hdv = round_up(head_dim, 16), round_up(head_dim_v, 16)
+        smem_usage_Q = round_up(tile_m * hd * width, 1024)
+        smem_usage_K = round_up(tile_n * hd * num_stages * width, 1024)
+        smem_usage_V = round_up(tile_n * hdv * num_stages * width, 1024)
         smem_usage_QV = (
             (smem_usage_Q + smem_usage_V) if not Q_in_regs else max(smem_usage_Q, smem_usage_V)
         )
         smem_usage = smem_usage_QV + smem_usage_K
-        # TODO: sm86 and sm89
-        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_80")
+        if smem_capacity is None:
+            smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_80")
         if smem_usage > smem_capacity:
             return False
         # fa4-jax fix: the epilogue stages the (tile_m, head_dim_v) O tile

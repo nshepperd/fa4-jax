@@ -119,9 +119,12 @@ class FlashAttentionBackwardSm80:
     def can_implement(
         dtype, head_dim, head_dim_v, m_block_size, n_block_size, num_stages_Q, num_stages_dO,
         num_threads, is_causal,
-        V_in_regs=False
+        V_in_regs=False, smem_capacity=None,
     ) -> bool:
         """Check if the kernel can be implemented with the given parameters.
+
+        ``smem_capacity`` (bytes) defaults to sm_80's; subclasses for parts
+        with less shared memory pass their own.
 
         :param dtype: data type
         :type dtype: cutlass.Numeric
@@ -149,18 +152,48 @@ class FlashAttentionBackwardSm80:
             return False
         if num_threads % 32 != 0:
             return False
+        if smem_capacity is None:
+            smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_80")
         # Check if block size setting is out of shared memory capacity
-        # Shared memory usage: Q tile + (K tile + V tile) where K and V use the same tile size
-        smem_usage_Q = m_block_size * head_dim * num_stages_Q * 2
-        smem_usage_dO = m_block_size * head_dim_v * num_stages_dO * 2
-        smem_usage_K = n_block_size * head_dim * 2
-        smem_usage_V = n_block_size * head_dim_v * 2
-        smem_usage_QV = (smem_usage_Q + smem_usage_V) if not V_in_regs else max(smem_usage_Q, smem_usage_V)
-        smem_usage = smem_usage_QV + smem_usage_dO + smem_usage_K
-        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_80")
+        smem_usage = FlashAttentionBackwardSm80.smem_usage_bytes(
+            dtype, head_dim, head_dim_v, m_block_size, n_block_size,
+            num_stages_Q, num_stages_dO, V_in_regs,
+        )
         if smem_usage > smem_capacity:
             return False
         return True
+
+    @staticmethod
+    def smem_usage_bytes(
+        dtype, head_dim, head_dim_v, m_block_size, n_block_size, num_stages_Q, num_stages_dO,
+        V_in_regs=False,
+    ) -> int:
+        """Bytes of the kernel's SharedStorage struct, mirroring
+        ``_get_shared_storage_cls`` / ``_setup_attributes`` exactly.
+
+        fa4-jax fix: upstream's estimate counted only the Q/dO/K/V tiles, so
+        it under-reported by the sP/sdS/sLSE/sdPsum buffers and the head-dim
+        padding -- enough to pass configs that then fail at launch (and
+        poison the CUDA context) on 99 KB parts.
+        """
+        def round_up(x, to):
+            return -(-x // to) * to
+
+        width = dtype.width // 8
+        hdim_multiple_of = 32  # keep in sync with __init__
+        hd = round_up(head_dim, hdim_multiple_of)
+        hdv = round_up(head_dim_v, hdim_multiple_of)
+        # Q/K/V/dO tiles: 1024-aligned MemRanges (swizzled layouts are dense).
+        sQ = round_up(m_block_size * hd * num_stages_Q * width, 1024)
+        sdO = round_up(m_block_size * hdv * num_stages_dO * width, 1024)
+        sK = round_up(n_block_size * hd * width, 1024)
+        sV = round_up(n_block_size * hdv * width, 1024)
+        sQV = (sQ + sV) if not V_in_regs else max(sQ, sV)
+        # sLSE / sdPsum: fp32 (m, stages) with the row stride rounded to 64.
+        sLSE = round_up(round_up(m_block_size, 64) * num_stages_Q * 4, 128)
+        # sP / sdS: (m, n) in the compute dtype.
+        sPdS = round_up(m_block_size * n_block_size * width, 128)
+        return sQV + sdO + sK + 2 * sLSE + 2 * sPdS
 
     def _check_type(
         self,

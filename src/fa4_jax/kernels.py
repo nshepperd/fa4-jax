@@ -619,10 +619,21 @@ def _get_static(cfg: AttnConfig, dtype, head_dim, head_dim_v, qhead_per_kvhead, 
 
 
 @functools.cache
-def _can_implement(kind: str, dtype, head_dim: int, head_dim_v: int, causal: bool, arch: int) -> bool:
+def _can_implement(
+    kind: str, dtype, head_dim: int, head_dim_v: int, causal: bool, arch: int, device: int
+) -> bool:
     """Ask the kernel class whether our tile config fits (SMEM budget, head
     dim limits); a launch that overflows SMEM would otherwise fail *inside*
-    CUDA and leave the context in an error state."""
+    CUDA and leave the context in an error state.
+
+    ``arch`` is the kernel family, ``device`` the real GPU (they differ under
+    a kernel_arch override). The family fixes the SMEM *formula*; the budget
+    is always the resident device's -- the SM80-MMA classes default to
+    sm_80's 163 KB, which is wrong for every consumer part (sm_86/89/120
+    have 99 KB) whether or not it was reached through an override."""
+    import cutlass.utils as utils_basic
+
+    smem_capacity = utils_basic.get_smem_capacity_in_bytes(f"sm_{device}")
     if kind == "fwd":
         if arch // 10 == 10:
             # The tcgen05 forward has no can_implement; keep the family's
@@ -631,7 +642,8 @@ def _can_implement(kind: str, dtype, head_dim: int, head_dim_v: int, causal: boo
             return head_dim <= 128 and head_dim_v <= 128
         tile_m, tile_n = _fwd_tile_mn(arch, head_dim)
         return _fwd_kernel_cls(arch).can_implement(
-            dtype, head_dim, head_dim_v, tile_m, tile_n, 1, 128, causal
+            dtype, head_dim, head_dim_v, tile_m, tile_n, 1, 128, causal,
+            smem_capacity=smem_capacity,
         )
     if kind == "bwd":
         if _bwd_use_sm100(arch, head_dim, head_dim_v):
@@ -643,7 +655,7 @@ def _can_implement(kind: str, dtype, head_dim: int, head_dim_v: int, causal: boo
         stages = 2 if head_dim <= 64 else 1
         return _bwd_kernel_cls(arch).can_implement(
             dtype, head_dim, head_dim_v, tile, tile, stages, stages,
-            _BWD_NUM_THREADS, causal,
+            _BWD_NUM_THREADS, causal, smem_capacity=smem_capacity,
         )
     if kind == "jvp":
         from fa4_jax.cute.flash_jvp import FlashAttentionJvpSm80
@@ -667,10 +679,10 @@ def _validate(cfg: AttnConfig, kind: str, q, k, v):
     # what lets e.g. the SM80-MMA kernels run on sm_100. Validate overrides
     # up front: an unrunnable family would otherwise die deep inside kernel
     # construction with an opaque assert.
+    device = _device_arch()
     if cfg.kernel_arch is not None:
         from fa4_jax.attention import kernel_arch_unsupported
 
-        device = _device_arch()
         reason = kernel_arch_unsupported(cfg.kernel_arch, device)
         if reason is not None:
             raise ValueError(
@@ -678,8 +690,8 @@ def _validate(cfg: AttnConfig, kind: str, q, k, v):
             )
         arch = cfg.kernel_arch
     else:
-        arch = _device_arch()
-    if not _can_implement(kind, dtype, head_dim, head_dim_v, cfg.causal, arch):
+        arch = device
+    if not _can_implement(kind, dtype, head_dim, head_dim_v, cfg.causal, arch, device):
         raise ValueError(
             f"FA4 {kind} kernel cannot run head_dim={head_dim}, head_dim_v={head_dim_v} "
             f"({q.dtype}) on sm_{arch}: tile does not fit the shared-memory budget "
