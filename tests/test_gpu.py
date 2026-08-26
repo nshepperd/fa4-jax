@@ -578,6 +578,52 @@ def test_public_surface():
     assert {"flash_attn", "MaskMod", "reference_attn"} <= set(fa4_jax.__all__)
 
 
+# ---------------------------------------------------------------- head-dim envelope
+#
+# Whether a large / mixed head-dim pair fits is family- AND device-dependent:
+# the SM80-MMA tiles fit hd 256 in sm_80's 163 KB but not in a GeForce's
+# 99 KB, and the tcgen05 kernels stop at 128. The contract is that every
+# pair either raises the clean "cannot run head_dim" ValueError up front or
+# computes correctly -- never a launch that fails inside CUDA and poisons the
+# context (which would take every later test down with it). Both fwd and bwd
+# have their own SMEM budgets, so both are swept.
+
+LARGE_HEAD_DIMS = [
+    (192, 192),
+    (256, 256),
+    (128, 256),  # d_v > d
+    (256, 128),  # d > d_v
+    (256, 64),  # bwd fits sm_120 here, fwd does not
+    (64, 192),
+]
+
+
+def _fits_or_rejects(fn, *args):
+    try:
+        return fn(*args)
+    except ValueError as e:
+        assert "cannot run head_dim=" in str(e), e
+        return None
+
+
+@pytest.mark.parametrize("d,d_v", LARGE_HEAD_DIMS, ids=lambda x: str(x))
+@pytest.mark.parametrize("causal", [False, True])
+def test_large_head_dims(d, d_v, causal):
+    q, k, v = _mk((1, 96, 160, 2, 1, d, d_v), jnp.bfloat16)
+    got = _fits_or_rejects(lambda: flash_attn(q, k, v, backend="cute", causal=causal))
+    if got is not None:
+        want = flash_attn(q, k, v, backend="reference", causal=causal)
+        assert_close(got, want, dtype=q.dtype)
+
+    rng = np.random.default_rng(1)
+    cot = jnp.asarray(rng.standard_normal((*q.shape[:3], d_v)), q.dtype)
+    grads = _fits_or_rejects(lambda: _grads(q, k, v, cot, causal=causal))
+    if grads is not None:
+        got, want = grads
+        for g, w, name in zip(got, want, "qkv"):
+            assert_close(g, w, dtype=q.dtype, msg=f"d{name}")
+
+
 def test_kernel_arch_validation():
     """Unrunnable kernel_arch values fail up front with a clear message,
     not deep inside kernel construction."""
