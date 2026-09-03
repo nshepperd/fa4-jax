@@ -51,6 +51,9 @@ SHAPES = [
     (1, 128, 128, 2, 1, 96, None),  # head_dim 96: padded to the 16-multiple tile
     (1, 128, 128, 2, 1, 64, 32),  # d_v != d
     (1, 128, 128, 2, 1, 64, 128),  # d_v > d
+    (1, 128, 128, 2, 1, 16, None),  # smallest head dim (padded to the 32-multiple accumulators)
+    (1, 128, 128, 2, 1, 48, None),  # 16 mod 32
+    (2, 128, 128, 2, 2, 48, 16),  # GQA + mixed small head dims
 ]
 
 

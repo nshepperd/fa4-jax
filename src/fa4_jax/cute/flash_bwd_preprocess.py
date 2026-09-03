@@ -367,8 +367,6 @@ class FlashAttentionBackwardPreprocess:
             tOpO = None
             if const_expr(self.check_hdim_v_oob):
                 tOpO = copy_utils.predicate_k(tOcO, limit=headdim_v)
-            # Each copy will use the same predicate
-            copy = partial(copy_utils.copy, pred=tOpO)
 
             tOrO = cute.make_rmem_tensor_like(tOgO)
             tOrdO = cute.make_rmem_tensor_like(tOgdO)
@@ -380,8 +378,14 @@ class FlashAttentionBackwardPreprocess:
                 # Instead of using tOcO, we using t0OcO and subtract the offset from the limit.
                 # This is bc the entries of t0OcO are known at compile time.
                 if t0OcO[0, m, 0][0] < seqlen_limit - tOcO[0][0]:
-                    copy(tOgO[None, m, None], tOrO[None, m, None])
-                    copy(tOgdO[None, m, None], tOrdO[None, m, None])
+                    # fa4-jax fix: the predicate is (rest_v, CPY_M, CPY_K); slice
+                    # it per row like the src (upstream passed the whole tensor,
+                    # which the IR verifier rejects whenever CPY_K == 1 -- head
+                    # dims 16 and 48 -- as a shape mismatch against the row's
+                    # (rest_v, CPY_K) copy).
+                    pred = tOpO[None, m, None] if const_expr(self.check_hdim_v_oob) else None
+                    copy_utils.copy(tOgO[None, m, None], tOrO[None, m, None], pred=pred)
+                    copy_utils.copy(tOgdO[None, m, None], tOrdO[None, m, None], pred=pred)
             # O and dO loads are done; signal that the next kernel can start.
             # Correctness is ensured by griddepcontrol_wait() in bwd_sm90 before it reads our outputs.
             if const_expr(self.use_pdl):

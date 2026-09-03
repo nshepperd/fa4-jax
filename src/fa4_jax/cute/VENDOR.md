@@ -116,10 +116,7 @@ reproduced in `fa4_jax/kernels.py`.
   block's offset and on the fragment layout, i.e. garbage dQ (and dK/dV
   under GQA). Verified on an H100: as shipped, head_dim 80 gives dQ with a
   max error of 1.2 against the reference (dK/dV, which take the direct TMA
-  store path, are fine); with 32 it matches to bf16 tolerance. (head_dim
-  48 -- and 16 -- fail to *compile* the backward on every family, sm_80
-  included, with a copy-predicate shape mismatch in the shared pre/postprocess
-  path; pre-existing, not touched here.) Upstream's SM100
+  store path, are fine); with 32 it matches to bf16 tolerance. Upstream's SM100
   backward pads to 16 too and shares the postprocess, so the same head dims
   are suspect there (untested here: no sm_100 device). (2) Varlen Q/K/V/dO TMA loads are ragged like the
   forward's (upstream rags only the dK/dV stores) — `dK = dS^T Q` and
@@ -132,6 +129,14 @@ reproduced in `fa4_jax/kernels.py`.
   `head_dim_v` (upstream: `head_dim`, for both Q and dO) -- with
   `head_dim_v < head_dim`, e.g. (64, 32), the 64-wide atom cannot tile the
   dO tile and TMA-atom creation fails at compile time.
+
+- `flash_bwd_preprocess.py`: the head-dim-OOB predicate for the O/dO loads
+  is sliced per row (`tOpO[None, m, None]`, as `flash_fwd.load_Q` does)
+  instead of passing the whole `(rest_v, CPY_M, CPY_K)` tensor to each
+  row's copy. The unsliced form fails IR verification with a predicate
+  shape mismatch whenever the padded head dim gives one copy chunk per row
+  (`CPY_K == 1`), i.e. head dims 16 and 48 could not compile the backward
+  on any family; 80 (three chunks) happened to pass.
 
 ## Updating
 

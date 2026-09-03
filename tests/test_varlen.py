@@ -316,6 +316,9 @@ def test_fwd_lse(lens_q, lens_k, kw):
         (2, 1, 96, None),  # padded head dim
         (2, 1, 64, 32),  # mixed head dims
         (2, 2, 64, 32),  # GQA + mixed dims
+        (2, 1, 16, None),  # smallest head dim
+        (2, 1, 48, None),  # 16 mod 32
+        (2, 2, 48, 16),  # GQA + mixed small head dims
     ],
 )
 def test_fwd_head_configs(h_kv, gqa, d, d_v):
@@ -391,6 +394,9 @@ def test_grad_window(window):
         (2, 2, 64, 32),  # GQA + mixed dims: SM80-MMA fallback on sm_100
         (2, 1, 64, 32),  # non-GQA mixed dims: SM80-MMA fallback, direct dK/dV
         (2, 1, 128, None),  # head_dim 128
+        (2, 1, 16, None),  # smallest head dim
+        (2, 1, 48, None),  # 16 mod 32
+        (2, 2, 48, 16),  # GQA + mixed small head dims
     ],
 )
 @pytest.mark.parametrize("lens", [[128, 128], [37, 71, 160]], ids=["aligned", "ragged"])
@@ -592,16 +598,16 @@ def test_fwd_seqused_k_only_cache_style():
 
 @cuda
 @pytest.mark.parametrize(
-    "h_kv,gqa,d_v",
-    [(2, 1, None), (2, 2, None), (2, 2, 32)],
-    ids=["mha", "gqa", "gqa-mixed"],
+    "h_kv,gqa,d,d_v",
+    [(2, 1, 64, None), (2, 2, 64, None), (2, 2, 64, 32), (2, 1, 16, None), (2, 1, 48, None)],
+    ids=["mha", "gqa", "gqa-mixed", "d16", "d48"],
 )
-def test_grad_seqused(h_kv, gqa, d_v):
+def test_grad_seqused(h_kv, gqa, d, d_v):
     """Backward with used-length overrides, including the fp32-accumulator
     GQA paths; gradients compared on used rows (dq via seqused_q, dk/dv via
     seqused_k), unused rows are unspecified."""
     q, k, v, cu, su_q, su_k = seqused_case(
-        *SEQUSED_CASE, dtype=jnp.bfloat16, h_q=h_kv * gqa, h_kv=h_kv, d_v=d_v, seed=7
+        *SEQUSED_CASE, dtype=jnp.bfloat16, h_q=h_kv * gqa, h_kv=h_kv, d=d, d_v=d_v, seed=7
     )
     kw = dict(seqused_q=su_q, seqused_k=su_k, causal=True)
 
