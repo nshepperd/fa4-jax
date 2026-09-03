@@ -1,9 +1,9 @@
 # fa4-jax
 
 FlashAttention-4 (Tri Dao's CuTe DSL kernels) as a JAX library, for the
-SM80/SM120 family (Ampere → consumer Blackwell) and SM100 (datacenter
-Blackwell: B200/GB200, via the tcgen05 kernels), built on
-[cutejax](../cutejax).
+SM80/SM120 family (Ampere → consumer Blackwell), SM90 (Hopper: H100/H200,
+via the wgmma + TMA kernels) and SM100 (datacenter Blackwell: B200/GB200,
+via the tcgen05 kernels), built on [cutejax](../cutejax).
 
 What it provides over `jax.nn.dot_product_attention`:
 
@@ -80,13 +80,18 @@ varlen call is rejected — the packing *is* the batch.
 
 Restrictions (kernel-side, all checked with clear errors): fp16/bf16, head_dim
 a multiple of 8 and ≤ 128 (the SM80/SM120 tile budget; on sm_100, larger heads
-would need 2-CTA MMAs, i.e. cluster launches, which this wrapper doesn't do),
-no cotangent through `lse` in reverse mode. GQA works in all three passes (the
-backward accumulates dK/dV in fp32 across the q heads of each kv head). On
-sm_100 the backward runs the tcgen05 kernel for equal head dims and falls back
-to the SM80-MMA kernel for mixed ones (which miscompile in upstream b26). Mask
+would need 2-CTA MMAs, i.e. cluster launches, which this wrapper doesn't do) —
+≤ 256 on sm_90, where the tiles come from upstream's per-head-dim table and a
+config is rejected only when its shared memory doesn't fit — no cotangent
+through `lse` in reverse mode. GQA works in all three passes (the backward
+accumulates dK/dV in fp32 across the q heads of each kv head). On sm_100 the
+backward runs the tcgen05 kernel for equal head dims and falls back to the
+SM80-MMA kernel for mixed ones (which miscompile in upstream b26); on sm_90 it
+runs the wgmma kernel whenever upstream's config for the head dim fits (GQA
+there needs equal head dims) and otherwise the same SM80-MMA fallback. Mask
 mods work in all three passes — the SM80/SM120 backward's mask_mod support is
-a local addition to the vendored kernel (the SM100 one has it upstream).
+a local addition to the vendored kernel (the SM90 and SM100 ones have it
+upstream).
 Combining
 causal/window_size with a mask_mod keeps the native band's KV-block skipping
 and runs the mod as a second masking pass over the visited tiles (also a
@@ -112,9 +117,10 @@ uv run pytest              # kernels vs the jnp reference (fwd/grad/jvp/masks) +
 Every kernel-facing test is parametrized over the vendored kernel families
 (`sm80`/`sm90`/`sm100`/`sm120` test ids) and runs each one the device can
 actually execute — e.g. a B200 runs the SM80-MMA and SM120 variants as well
-as the native tcgen05 kernels, since cp.async/mma.sync exist there too. The
-rest show up as skips, so reports state exactly which implementations have
-coverage (`sm90` always skips: not vendored). `FA4_TEST_ARCHS=sm100` (comma
+as the native tcgen05 kernels, and an H100 runs them next to the native wgmma
+kernels, since cp.async/mma.sync exist there too. The rest show up as skips,
+so reports state exactly which implementations have coverage (`sm90` needs a
+Hopper device, `sm100` a datacenter Blackwell). `FA4_TEST_ARCHS=sm100` (comma
 list) restricts the sweep for quick iterations; the same selection is
 available to users as `flash_attn(..., kernel_arch=80)`.
 

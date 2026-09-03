@@ -27,6 +27,7 @@ serves every length.
 from __future__ import annotations
 
 import functools
+from dataclasses import dataclass
 
 import cutejax
 import cutlass
@@ -92,8 +93,10 @@ def _cute_mask_mod(mask_def: jax.tree_util.PyTreeDef):
 
 @functools.cache
 def _fwd_kernel_cls(arch: int):
-    # SM120 differs from SM80 only in the shared-memory capacity check, but
-    # that check is what keeps 128x128 tiles from silently overflowing 99 KB.
+    """The SM80-MMA (cp.async + mma.sync) forward family. SM120 differs from
+    SM80 only in the shared-memory capacity check, but that check is what
+    keeps 128x128 tiles from silently overflowing 99 KB. The tcgen05 (sm_100)
+    and wgmma (sm_90) forwards are separate classes, picked in _get_fwd."""
     if arch // 10 == 12:
         from fa4_jax.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 
@@ -103,8 +106,7 @@ def _fwd_kernel_cls(arch: int):
 
         return FlashAttentionForwardSm80
     raise NotImplementedError(
-        f"fa4-jax wraps the SM80/SM100/SM120 kernels only; device is sm_{arch}. "
-        "Hopper (sm_90) has its own FA4 kernels that are not vendored here."
+        f"fa4-jax wraps the SM80/SM90/SM100/SM120 kernel families only; got sm_{arch}"
     )
 
 
@@ -115,8 +117,132 @@ def _fwd_tile_mn(arch: int, head_dim: int) -> tuple[int, int]:
     return 128, 64
 
 
+# ---------------------------------------------------------------- hopper configs
+#
+# The sm_90 (wgmma + TMA) kernels are tuned per head dim: upstream's
+# interface.py carries the tables (FA3's C++ configs, re-benchmarked on H100
+# SXM for the Python kernels), reproduced here minus the block-sparse cases.
+# Unlike the other families these tiles are not square, so the backward's
+# accumulator padding, preprocess and postprocess must follow (tile_m, tile_n)
+# rather than one tile size -- see _BwdPlan.
+
+
+@dataclass(frozen=True)
+class _FwdCfgSm90:
+    tile_m: int
+    tile_n: int
+    mma_pv_is_rs: bool  # PV MMA reads P from registers (False: staged through smem)
+    intra_wg_overlap: bool
+
+
+def _fwd_cfg_sm90(head_dim: int, head_dim_v: int, causal: bool, local: bool) -> _FwdCfgSm90:
+    """interface._tile_size_fwd_sm90, keyed on the *larger* head dim: upstream
+    keys on head_dim and sizes the O accumulator for head_dim_v ~ head_dim,
+    but a much larger head_dim_v under the 192-row / 3-warpgroup tiles would
+    blow the 160-register budget of that layout."""
+    hd = max(head_dim, head_dim_v)
+    if hd <= 64:
+        return _FwdCfgSm90(192, 128, True, True)
+    if hd <= 96:
+        # Upstream: RS is catastrophic with 192-row tiles at this head dim.
+        return _FwdCfgSm90(192, 128 if (causal or local) else 144, False, True)
+    if hd <= 128:
+        return _FwdCfgSm90(128, 128, True, True)
+    if hd <= 192:
+        return _FwdCfgSm90(128, 96 if local else (128 if head_dim_v <= 128 else 112), True, True)
+    return _FwdCfgSm90(128, 64 if local else 80, True, True)
+
+
+@dataclass(frozen=True)
+class _BwdCfgSm90:
+    """One row of interface._tile_size_bwd_sm90 (FA3's C++ configs)."""
+
+    tile_m: int
+    tile_n: int
+    Q_stage: int
+    dO_stage: int
+    PdS_stage: int
+    SdP_swapAB: bool
+    dKV_swapAB: bool
+    dQ_swapAB: bool
+    AtomLayoutMSdP: int
+    AtomLayoutNdKV: int
+    AtomLayoutMdQ: int
+    num_wg: int = 2  # MMA warpgroups; the kernel adds one producer warpgroup
+    dQ_single_wg: bool = False  # only warpgroup 0 computes dQ
+
+    @property
+    def num_threads(self) -> int:
+        return (self.num_wg + 1) * 128
+
+
+def _bwd_cfg_sm90(head_dim: int, head_dim_v: int, causal: bool, local: bool) -> _BwdCfgSm90:
+    if head_dim <= 64:
+        return _BwdCfgSm90(128, 128, 2, 2, 2, True, False, False, 1, 2, 2)
+    if head_dim <= 96:
+        return _BwdCfgSm90(64, 128, 2, 2, 2, True, False, False, 1, 2, 1, dQ_single_wg=True)
+    if head_dim <= 128:
+        tile_m = 64 if (causal or local) else 80
+        return _BwdCfgSm90(tile_m, 128, 2, 2, 2, True, False, tile_m % 64 != 0, 1, 2, 1)
+    if head_dim <= 192:
+        return _BwdCfgSm90(64, 96, 2, 2 if head_dim_v <= 128 else 1, 1, False, True, False, 1, 2, 1)
+    return _BwdCfgSm90(64, 64, 1, 1, 1, False, False, False, 1, 1, 1)
+
+
+def _sm90_bwd_kwargs(c: _BwdCfgSm90, causal: bool, local: bool) -> dict:
+    """Constructor kwargs of FlashAttentionBackwardSm90 for one config row
+    (shared by can_implement and the real construction)."""
+    return dict(
+        is_causal=causal,
+        is_local=local,
+        deterministic=False,
+        tile_m=c.tile_m,
+        tile_n=c.tile_n,
+        Q_stage=c.Q_stage,
+        dO_stage=c.dO_stage,
+        PdS_stage=c.PdS_stage,
+        SdP_swapAB=c.SdP_swapAB,
+        dKV_swapAB=c.dKV_swapAB,
+        dQ_swapAB=c.dQ_swapAB,
+        AtomLayoutMSdP=c.AtomLayoutMSdP,
+        AtomLayoutNdKV=c.AtomLayoutNdKV,
+        AtomLayoutMdQ=c.AtomLayoutMdQ,
+        num_threads=c.num_threads,
+        V_in_regs=False,
+        dQ_single_wg=c.dQ_single_wg,
+    )
+
+
 @functools.cache
 def _get_fwd(dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, local, mask_mod, n_aux, arch, varlen=False):
+    if arch // 10 == 9:
+        # Hopper (wgmma + TMA). num_stages=2 is upstream's interface setting;
+        # the kernel derives its thread count from the tile (tile_m // 64 MMA
+        # warpgroups plus one producer warpgroup), so the value passed is
+        # nominal. Varlen needs no constructor flag: the kernel switches to
+        # the varlen scheduler and a ragged TMA O store on its own when it
+        # sees cu_seqlens.
+        from fa4_jax.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
+
+        c = _fwd_cfg_sm90(head_dim, head_dim_v, causal, local)
+        return FlashAttentionForwardSm90(
+            dtype,
+            head_dim,
+            head_dim_v,
+            qhead_per_kvhead,
+            is_causal=causal,
+            is_local=local,
+            pack_gqa=False,
+            tile_m=c.tile_m,
+            tile_n=c.tile_n,
+            num_stages=2,
+            num_threads=(c.tile_m // 64 + 1) * 128,
+            Q_in_regs=False,
+            intra_wg_overlap=c.intra_wg_overlap,
+            mma_pv_is_rs=c.mma_pv_is_rs,
+            mask_mod=None if mask_mod is None else _cute_mask_mod(mask_mod),
+            has_aux_tensors=n_aux > 0,
+        )
     if arch // 10 == 10:
         # Datacenter Blackwell (tcgen05). Fixed knobs where upstream's
         # interface.py has shape-dependent heuristics, since batch/seqlen stay
@@ -234,33 +360,36 @@ def _fa4_fwd_lse(stream, tree, mO, mLSE):
 # into fp32 dKaccum/dVaccum laid out like dQaccum (zeroed here with
 # jnp.zeros; the preprocess only zeroes dQaccum) and leaves the softmax scale
 # off dK. The same postprocess kernel then converts both: dK with the scale,
-# dV with scale 1. Its tile is _bwd_tile_m, which matches the kv tile because
-# the backward's q and kv tiles are equal on every path here.
+# dV with scale 1. Those run with the kv tile (tile_n) and the dK/dV MMA
+# layout, which differ from dQ's on sm_90 -- hence separate "post_k"/"post_v"
+# kernel objects next to "post" (see _bwd_post_params).
 #
 # Tile config: upstream has no sm_8x branch for the backward -- arch 8 falls
 # through to the SM100 settings, which ask for 128x128 tiles that will not fit
 # sm_86's 100 KB of SMEM. We use the SM120 config (64x64, 128 threads) on both
 # sm_8x and sm_120 instead: conservative, fits everywhere, and it is the only
 # one upstream actually tunes for an SM80-MMA kernel. SM100 (tcgen05) uses
-# upstream's 128x128.
+# upstream's 128x128; SM90 (wgmma) its per-head-dim table (_bwd_cfg_sm90).
 _BWD_NUM_THREADS = 128
 _BWD_ATOM_LAYOUT = 4
 
 
-def _bwd_use_sm100(arch: int, head_dim: int, head_dim_v: int) -> bool:
-    """Whether the tcgen05 backward serves this head config.
+@dataclass(frozen=True)
+class _BwdPlan:
+    """Which backward kernel serves a head config, plus the tile geometry that
+    the fp32 accumulators, the preprocess and the postprocess must agree on
+    (dQaccum is padded per tile_m rows, dK/dV accum per tile_n).
 
-    The 1-CTA SM100 kernel takes head dims up to 128, but 4.0.0b26's
-    mixed-dims path (head_dim != head_dim_v) miscompiles (a tmem layout
-    division error), so those fall back to the SM80-MMA kernel, which
-    compiles fine for sm_100 -- cp.async and mma.sync exist there too.
+    ``family`` is 100 (tcgen05), 90 (wgmma) or 80 (the SM80-MMA kernel:
+    native on sm_8x/sm_12x, and the fallback on sm_90/sm_100 for head configs
+    their native kernels cannot take -- cp.async and mma.sync exist there
+    too). The wgmma family carries its full config row in ``sm90``.
     """
-    return arch // 10 == 10 and head_dim == head_dim_v and head_dim <= 128
 
-
-def _bwd_tile_m(arch: int, head_dim: int, head_dim_v: int) -> int:
-    """The backward's (square) tile size; also the accumulator padding unit."""
-    return 128 if _bwd_use_sm100(arch, head_dim, head_dim_v) else 64
+    family: int
+    tile_m: int
+    tile_n: int
+    sm90: _BwdCfgSm90 | None = None
 
 
 def _round_up(x: int, to: int) -> int:
@@ -269,23 +398,70 @@ def _round_up(x: int, to: int) -> int:
 
 @functools.cache
 def _bwd_kernel_cls(arch: int):
+    """The SM80-MMA backward family: the SM120 subclass on sm_12x (its default
+    SMEM budget), the SM80 class everywhere else -- including sm_90/sm_100,
+    where it is the fallback for what the native kernels reject."""
     if arch // 10 == 12:
         from fa4_jax.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
 
         return FlashAttentionBackwardSm120
-    if arch // 10 in (8, 10):  # sm_100 uses this as the mixed-head-dims fallback
+    if arch // 10 in (8, 9, 10, 11):
         from fa4_jax.cute.flash_bwd import FlashAttentionBackwardSm80
 
         return FlashAttentionBackwardSm80
     raise NotImplementedError(
-        f"fa4 backward wraps the SM80/SM100/SM120 kernels only; device is sm_{arch}"
+        f"fa4 backward wraps the SM80/SM90/SM100/SM120 kernel families only; got sm_{arch}"
     )
 
 
 @functools.cache
-def _get_bwd(dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, local, mask_mod, n_aux, arch):
-    tile = _bwd_tile_m(arch, head_dim, head_dim_v)
-    if _bwd_use_sm100(arch, head_dim, head_dim_v):
+def _bwd_plan(
+    dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, local, arch, device
+) -> _BwdPlan | None:
+    """Pick the backward kernel for (family ``arch``, resident ``device``), or
+    None if nothing fits (the caller raises a clean ValueError).
+
+    - sm_100: the 1-CTA tcgen05 kernel takes head dims up to 128, but
+      4.0.0b26's mixed-dims path (head_dim != head_dim_v) miscompiles (a tmem
+      layout division error), so those fall through to the SM80-MMA kernel.
+    - sm_90: the wgmma kernel with upstream's config row for the head dim,
+      when its SharedStorage fits the device (upstream's largest configs sit
+      exactly at the 227 KB limit) and the config is legal (GQA needs equal
+      head dims); otherwise the SM80-MMA fallback.
+    - else the SM80-MMA kernel, if its 64x64 tiles fit the device's SMEM.
+    """
+    import cutlass.utils as utils_basic
+
+    smem = utils_basic.get_smem_capacity_in_bytes(f"sm_{device}")
+    if arch // 10 == 10 and head_dim == head_dim_v and head_dim <= 128:
+        # No can_implement on the tcgen05 backward; the head-dim bound above
+        # is its envelope and the constructor asserts the rest.
+        return _BwdPlan(100, 128, 128)
+    if arch // 10 == 9:
+        from fa4_jax.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
+
+        c = _bwd_cfg_sm90(head_dim, head_dim_v, causal, local)
+        if FlashAttentionBackwardSm90.can_implement(
+            dtype, head_dim, head_dim_v, qhead_per_kvhead,
+            **_sm90_bwd_kwargs(c, causal, local), smem_capacity=smem,
+        ):
+            return _BwdPlan(90, c.tile_m, c.tile_n, c)
+    tile = 64
+    stages = 2 if head_dim <= 64 else 1
+    if _bwd_kernel_cls(arch).can_implement(
+        dtype, head_dim, head_dim_v, tile, tile, stages, stages,
+        _BWD_NUM_THREADS, causal, smem_capacity=smem,
+    ):
+        return _BwdPlan(80, tile, tile)
+    return None
+
+
+@functools.cache
+def _get_bwd(
+    dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, local, mask_mod, n_aux, arch, plan: _BwdPlan
+):
+    mm = None if mask_mod is None else _cute_mask_mod(mask_mod)
+    if plan.family == 100:
         from fa4_jax.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
 
         return FlashAttentionBackwardSm100(
@@ -294,13 +470,25 @@ def _get_bwd(dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, local, mask_
             is_causal=causal,
             is_local=local,
             qhead_per_kvhead=qhead_per_kvhead,
-            tile_m=tile,
-            tile_n=tile,
+            tile_m=plan.tile_m,
+            tile_n=plan.tile_n,
             deterministic=False,
             spt=False,
             cluster_size=1,
             use_2cta_instrs=False,
-            mask_mod=None if mask_mod is None else _cute_mask_mod(mask_mod),
+            mask_mod=mm,
+            has_aux_tensors=n_aux > 0,
+        )
+    if plan.family == 90:
+        from fa4_jax.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
+
+        return FlashAttentionBackwardSm90(
+            dtype,
+            head_dim,
+            head_dim_v,
+            qhead_per_kvhead,
+            **_sm90_bwd_kwargs(plan.sm90, causal, local),
+            mask_mod=mm,
             has_aux_tensors=n_aux > 0,
         )
     stages = 2 if head_dim <= 64 else 1
@@ -309,8 +497,8 @@ def _get_bwd(dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, local, mask_
         head_dim,
         head_dim_v,
         qhead_per_kvhead,
-        tile,  # tile_m
-        tile,  # tile_n
+        plan.tile_m,
+        plan.tile_n,
         stages,  # num_stages_Q
         stages,  # num_stages_dO
         _BWD_NUM_THREADS,
@@ -324,39 +512,51 @@ def _get_bwd(dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, local, mask_
         _BWD_ATOM_LAYOUT,  # AtomLayoutNdKV
         _BWD_ATOM_LAYOUT,  # AtomLayoutMdQ
         V_in_regs=False,
-        mask_mod=None if mask_mod is None else _cute_mask_mod(mask_mod),
+        mask_mod=mm,
         has_aux_tensors=n_aux > 0,
     )
 
 
 @functools.cache
-def _get_bwd_pre(dtype, head_dim, head_dim_v, arch):
+def _get_bwd_pre(dtype, head_dim, head_dim_v, tile_m):
     from fa4_jax.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 
-    return FlashAttentionBackwardPreprocess(
-        dtype, head_dim, head_dim_v, _bwd_tile_m(arch, head_dim, head_dim_v)
-    )
+    return FlashAttentionBackwardPreprocess(dtype, head_dim, head_dim_v, tile_m)
+
+
+def _bwd_post_params(plan: _BwdPlan, arch: int, which: str) -> tuple:
+    """(layout_arch, block, num_threads, atom_layout, swap_ab) of the
+    postprocess that converts the accumulator ``which`` ("dq" or "dkv").
+
+    These select the accumulator element layout, which must match the kernel
+    that wrote it, not the device: the tcgen05 backward writes the SM100
+    layout (AtomLayoutMdQ=1, upstream's default), the wgmma backward its
+    config row's MMA layouts -- different for dQ (tile_m rows, AtomLayoutMdQ,
+    dQ_swapAB, and one warpgroup when dQ_single_wg) and dK/dV (tile_n rows,
+    AtomLayoutNdKV, dKV_swapAB) -- and the SM80-MMA kernel the sm_8x/12x one,
+    including when it runs on sm_90/sm_100 as the fallback.
+    """
+    if plan.family == 100:
+        return arch, plan.tile_m, _BWD_NUM_THREADS, 1, False
+    if plan.family == 90:
+        c = plan.sm90
+        if which == "dq":
+            threads = 128 if c.dQ_single_wg else c.num_wg * 128
+            return 90, c.tile_m, threads, c.AtomLayoutMdQ, c.dQ_swapAB
+        return 90, c.tile_n, c.num_wg * 128, c.AtomLayoutNdKV, c.dKV_swapAB
+    layout_arch = arch if arch // 10 in (8, 12) else 120
+    return layout_arch, plan.tile_m, _BWD_NUM_THREADS, _BWD_ATOM_LAYOUT, False
 
 
 @functools.cache
-def _get_bwd_post(dtype, head_dim, arch, sm100: bool):
+def _get_bwd_post(dtype, head_dim, layout_arch, block, num_threads, atom_layout, swap_ab):
     """Postprocess for one accumulator; head_dim is the converted tensor's
-    (dQ/dK take the problem's head_dim, dV takes head_dim_v).
-
-    The arch/block/atom parameters select the accumulator element layout,
-    which must match the kernel that wrote it: the tcgen05 backward writes
-    the SM100 layout (AtomLayoutMdQ=1, upstream's default), the SM80-MMA
-    kernel the sm_8x/12x one -- including when it runs on sm_100 as the
-    mixed-head-dims fallback, hence the layout arch, not the device arch.
-    """
+    (dQ/dK take the problem's head_dim, dV takes head_dim_v). The layout
+    parameters come from _bwd_post_params."""
     from fa4_jax.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
 
-    if sm100:
-        layout_arch, atom_layout, block = arch, 1, 128
-    else:
-        layout_arch, atom_layout, block = (120 if arch // 10 == 10 else arch), _BWD_ATOM_LAYOUT, 64
     return FlashAttentionBackwardPostprocess(
-        dtype, head_dim, layout_arch, block, _BWD_NUM_THREADS, atom_layout, False
+        dtype, head_dim, layout_arch, block, num_threads, atom_layout, swap_ab
     )
 
 
@@ -414,8 +614,15 @@ def _fa4_bwd_gqa(
 
 @cute.jit
 def _fa4_bwd_post(stream, tree, mdQaccum, mdQ):
-    """dQaccum -> dQ (or, under GQA, dKaccum -> dK: same head_dim, same scale)."""
+    """dQaccum -> dQ."""
     tree["post"](mdQaccum, mdQ, cutlass.Float32(tree["scale"]), None, None, None, stream=stream)
+
+
+@cute.jit
+def _fa4_bwd_post_dk(stream, tree, mdKaccum, mdK):
+    """dKaccum -> dK under GQA: same head_dim and scale as dQ, but the kv
+    tile's accumulator layout (they differ on sm_90)."""
+    tree["post_k"](mdKaccum, mdK, cutlass.Float32(tree["scale"]), None, None, None, stream=stream)
 
 
 @cute.jit
@@ -503,16 +710,26 @@ def _fa4_bwd_gqa_varlen(
 
 
 @cute.jit
-def _fa4_bwd_post_varlen(stream, tree, mdAccum, cu, su, mdX):
-    """Accumulator -> dQ (or dK under GQA; cu/su are the matching q- or
-    k-side seqlen arrays)."""
-    tree["post"](mdAccum, mdX, cutlass.Float32(tree["scale"]), cu, su, None, stream=stream)
+def _fa4_bwd_post_varlen(stream, tree, mdAccum, cu_q, su_q, mdQ):
+    """dQaccum -> dQ."""
+    tree["post"](mdAccum, mdQ, cutlass.Float32(tree["scale"]), cu_q, su_q, None, stream=stream)
 
 
 @cute.jit
-def _fa4_bwd_post_varlen_dp(stream, tree, mdAccum, cu, su, _mdX_in, mdX):
-    """defined_padding variant: mdX arrives zero-filled and donated."""
-    tree["post"](mdAccum, mdX, cutlass.Float32(tree["scale"]), cu, su, None, stream=stream)
+def _fa4_bwd_post_varlen_dp(stream, tree, mdAccum, cu_q, su_q, _mdQ_in, mdQ):
+    """defined_padding variant: mdQ arrives zero-filled and donated."""
+    tree["post"](mdAccum, mdQ, cutlass.Float32(tree["scale"]), cu_q, su_q, None, stream=stream)
+
+
+@cute.jit
+def _fa4_bwd_post_dk_varlen(stream, tree, mdKaccum, cu_k, su_k, mdK):
+    """dKaccum -> dK under GQA (k-side seqlen arrays, kv-tile accumulator layout)."""
+    tree["post_k"](mdKaccum, mdK, cutlass.Float32(tree["scale"]), cu_k, su_k, None, stream=stream)
+
+
+@cute.jit
+def _fa4_bwd_post_dk_varlen_dp(stream, tree, mdKaccum, cu_k, su_k, _mdK_in, mdK):
+    tree["post_k"](mdKaccum, mdK, cutlass.Float32(tree["scale"]), cu_k, su_k, None, stream=stream)
 
 
 @cute.jit
@@ -601,15 +818,20 @@ def _get_static(cfg: AttnConfig, dtype, head_dim, head_dim_v, qhead_per_kvhead, 
             causal, local, mask_mod, cfg.n_aux, arch, cfg.varlen,
         )
     elif kind == "bwd":
+        plan = _bwd_plan(
+            dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, local, arch, _device_arch()
+        )
+        assert plan is not None, "unreachable: _validate checked _can_implement"
         st["bwd"] = _get_bwd(
             dtype, head_dim, head_dim_v, qhead_per_kvhead,
-            causal, local, mask_mod, cfg.n_aux, arch,
+            causal, local, mask_mod, cfg.n_aux, arch, plan,
         )
-        sm100 = _bwd_use_sm100(arch, head_dim, head_dim_v)
-        st["pre"] = _get_bwd_pre(dtype, head_dim, head_dim_v, arch)
-        st["post"] = _get_bwd_post(dtype, head_dim, arch, sm100)
+        st["pre"] = _get_bwd_pre(dtype, head_dim, head_dim_v, plan.tile_m)
+        st["post"] = _get_bwd_post(dtype, head_dim, *_bwd_post_params(plan, arch, "dq"))
         if qhead_per_kvhead > 1:
-            st["post_v"] = _get_bwd_post(dtype, head_dim_v, arch, sm100)
+            dkv = _bwd_post_params(plan, arch, "dkv")
+            st["post_k"] = _get_bwd_post(dtype, head_dim, *dkv)
+            st["post_v"] = _get_bwd_post(dtype, head_dim_v, *dkv)
     elif kind == "jvp":
         st["jvp"] = _get_jvp(
             dtype, head_dim, head_dim_v, qhead_per_kvhead,
@@ -620,7 +842,8 @@ def _get_static(cfg: AttnConfig, dtype, head_dim, head_dim_v, qhead_per_kvhead, 
 
 @functools.cache
 def _can_implement(
-    kind: str, dtype, head_dim: int, head_dim_v: int, causal: bool, arch: int, device: int
+    kind: str, dtype, head_dim: int, head_dim_v: int, qhead_per_kvhead: int,
+    causal: bool, local: bool, arch: int, device: int,
 ) -> bool:
     """Ask the kernel class whether our tile config fits (SMEM budget, head
     dim limits); a launch that overflows SMEM would otherwise fail *inside*
@@ -640,23 +863,23 @@ def _can_implement(
             # public envelope (head dims <= 128 -- upstream's "standard
             # range" for SM100, larger needs 2-CTA MMAs we don't launch).
             return head_dim <= 128 and head_dim_v <= 128
+        if arch // 10 == 9:
+            from fa4_jax.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
+
+            c = _fwd_cfg_sm90(head_dim, head_dim_v, causal, local)
+            return FlashAttentionForwardSm90.can_implement(
+                dtype, head_dim, head_dim_v, c.tile_m, c.tile_n, 2,
+                (c.tile_m // 64 + 1) * 128, causal,
+                Q_in_regs=False, mma_pv_is_rs=c.mma_pv_is_rs, smem_capacity=smem_capacity,
+            )
         tile_m, tile_n = _fwd_tile_mn(arch, head_dim)
         return _fwd_kernel_cls(arch).can_implement(
             dtype, head_dim, head_dim_v, tile_m, tile_n, 1, 128, causal,
             smem_capacity=smem_capacity,
         )
     if kind == "bwd":
-        if _bwd_use_sm100(arch, head_dim, head_dim_v):
-            # No can_implement on the tcgen05 backward; _bwd_use_sm100 already
-            # bounds the head dims, its constructor asserts the rest.
-            return True
-        # sm_100 mixed-dims fallback runs the SM80-MMA kernel: use its check.
-        tile = _bwd_tile_m(arch, head_dim, head_dim_v)
-        stages = 2 if head_dim <= 64 else 1
-        return _bwd_kernel_cls(arch).can_implement(
-            dtype, head_dim, head_dim_v, tile, tile, stages, stages,
-            _BWD_NUM_THREADS, causal, smem_capacity=smem_capacity,
-        )
+        plan = _bwd_plan(dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, local, arch, device)
+        return plan is not None
     if kind == "jvp":
         from fa4_jax.cute.flash_jvp import FlashAttentionJvpSm80
 
@@ -691,13 +914,17 @@ def _validate(cfg: AttnConfig, kind: str, q, k, v):
         arch = cfg.kernel_arch
     else:
         arch = device
-    if not _can_implement(kind, dtype, head_dim, head_dim_v, cfg.causal, arch, device):
+    ratio = q.shape[-2] // k.shape[-2]
+    if not _can_implement(
+        kind, dtype, head_dim, head_dim_v, ratio, cfg.causal, cfg.local, arch, device
+    ):
         raise ValueError(
             f"FA4 {kind} kernel cannot run head_dim={head_dim}, head_dim_v={head_dim_v} "
             f"({q.dtype}) on sm_{arch}: tile does not fit the shared-memory budget "
-            "or the head dims exceed what the kernel supports (<= 128 on sm_8x/sm_120)"
+            "or the head dims exceed what the kernel supports (<= 128 on "
+            "sm_8x/sm_10x/sm_12x, <= 256 on sm_90)"
         )
-    return dtype, head_dim, head_dim_v, q.shape[-2] // k.shape[-2], arch
+    return dtype, head_dim, head_dim_v, ratio, arch
 
 
 class CuteBackend:
@@ -819,8 +1046,8 @@ class CuteBackend:
         d_pad = _round_up(d, 32)
         f32 = jnp.float32
         dtype, hd, hdv, ratio, arch = _validate(cfg, "bwd", q, k, v)
-        bwd_tile = _bwd_tile_m(arch, hd, hdv)
-        s_q_pad = _round_up(s_q, bwd_tile)
+        plan = _bwd_plan(dtype, hd, hdv, ratio, cfg.causal, cfg.local, arch, _device_arch())
+        s_q_pad = _round_up(s_q, plan.tile_m)
         st = _get_static(cfg, dtype, hd, hdv, ratio, arch, "bwd")
 
         dpsum, lse_log2, dq_accum = cutejax.call(
@@ -851,7 +1078,7 @@ class CuteBackend:
                 name="fa4_bwd",
             )
         else:
-            s_kv_pad = _round_up(s_kv, bwd_tile)
+            s_kv_pad = _round_up(s_kv, plan.tile_n)
             dk_accum = jnp.zeros((b, h_kv, s_kv_pad * d_pad), f32)
             dv_accum = jnp.zeros((b, h_kv, s_kv_pad * _round_up(d_v, 32)), f32)
             dq_accum, dk_accum, dv_accum = cutejax.call(
@@ -868,7 +1095,7 @@ class CuteBackend:
                 name="fa4_bwd_gqa",
             )
             dk = cutejax.call(
-                _fa4_bwd_post,
+                _fa4_bwd_post_dk,
                 jax.ShapeDtypeStruct(k.shape, k.dtype),
                 st, dk_accum,
                 in_specs=[_F32_SPEC],
@@ -913,8 +1140,8 @@ class CuteBackend:
         n_batch = cu_q.shape[0] - 1
         d_pad = _round_up(d, 32)
         dtype, hd, hdv, ratio, arch = _validate(cfg, "bwd", q, k, v)
-        bwd_tile = _bwd_tile_m(arch, hd, hdv)
-        s_q_pad = _round_up(total_q, bwd_tile) + n_batch * bwd_tile
+        plan = _bwd_plan(dtype, hd, hdv, ratio, cfg.causal, cfg.local, arch, _device_arch())
+        s_q_pad = _round_up(total_q, plan.tile_m) + n_batch * plan.tile_m
         st = _get_static(cfg, dtype, hd, hdv, ratio, arch, "bwd")
 
         dpsum, lse_log2, dq_accum = cutejax.call(
@@ -967,7 +1194,7 @@ class CuteBackend:
                     name="fa4_bwd_varlen",
                 )
         else:
-            s_kv_pad = _round_up(total_k, bwd_tile) + n_batch * bwd_tile
+            s_kv_pad = _round_up(total_k, plan.tile_n) + n_batch * plan.tile_n
             dk_accum = jnp.zeros((h_kv, s_kv_pad * d_pad), f32)
             dv_accum = jnp.zeros((h_kv, s_kv_pad * _round_up(d_v, 32)), f32)
             dq_accum, dk_accum, dv_accum = cutejax.call(
@@ -985,7 +1212,7 @@ class CuteBackend:
                 name="fa4_bwd_gqa_varlen",
             )
             dk = self._post_varlen(
-                _fa4_bwd_post_varlen, _fa4_bwd_post_varlen_dp, defined,
+                _fa4_bwd_post_dk_varlen, _fa4_bwd_post_dk_varlen_dp, defined,
                 jax.ShapeDtypeStruct(k.shape, k.dtype),
                 st, dk_accum, cu_k, su_k, "fa4_bwd_post_dk_varlen",
             )

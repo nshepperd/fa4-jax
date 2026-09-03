@@ -7,6 +7,14 @@ from cutlass import Int32, const_expr
 
 from quack import copy_utils
 
+# fa4-jax: the ragged (varlen TMA) offsets go through our copy_utils, whose
+# wraparound extents are runtime values. quack's build them as static ints,
+# and with fa4-jax's compile-time head dims the layout's static size product
+# overflows int64 and make_tensor aborts (std::bad_variant_access). Creators
+# of ragged tensors (the sm90 kernels' O and dK/dV stores) use the same
+# module; the two flavors are not interchangeable.
+from fa4_jax.cute.copy_utils import offset_ragged_tensor as _offset_ragged_tensor
+
 """
 This consolidates all the info related to sequence length. This is so that we can do all
 the gmem reads once at the beginning of each tile, rather than having to repeat these reads
@@ -172,10 +180,8 @@ class SeqlenInfoQK:
             else:
                 offset_q = self.offset_q if const_expr(not padded) else self.padded_offset_q
             if const_expr(cute.rank(mQ.shape[0]) == 1):
-                return copy_utils.offset_ragged_tensor(
-                    mQ, offset_q, self.seqlen_q, ragged_dim=0, ptr_shift=True
-                )
-            else:  # PackGQA
+                return _offset_ragged_tensor(mQ, offset_q, self.seqlen_q, ragged_dim=0)
+            else:  # PackGQA (quack's ptr_shift flavor; unused by fa4-jax, which never packs GQA)
                 assert cute.rank(mQ.shape[0]) == 2
                 # Unpack before calling offset_ragged_tensor, then pack
                 idx = ((None, None),) + (None,) * (cute.rank(mQ) - 1)
@@ -212,9 +218,7 @@ class SeqlenInfoQK:
             else:
                 offset_k = self.offset_k if const_expr(not padded) else self.padded_offset_k
                 offset_k *= multiple
-            return copy_utils.offset_ragged_tensor(
-                mK, offset_k, self.seqlen_k, ragged_dim=0, ptr_shift=True
-            )
+            return _offset_ragged_tensor(mK, offset_k, self.seqlen_k, ragged_dim=0)
 
 
 @dataclass(frozen=True)

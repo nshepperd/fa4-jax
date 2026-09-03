@@ -2,7 +2,7 @@
 kernel) against the plain-jnp reference backend, for values, gradients and
 JVPs.
 
-Needs a CUDA device (sm_86/sm_120 and sm_100 are what this repo targets).
+Needs a CUDA device (sm_86/sm_120, sm_90 and sm_100 are what this repo targets).
 Kernel compiles are cached per (head config, mask treedef), so the
 parametrized sweeps mostly reuse a handful of compiles.
 """
@@ -626,15 +626,21 @@ def test_large_head_dims(d, d_v, causal):
 
 def test_kernel_arch_validation():
     """Unrunnable kernel_arch values fail up front with a clear message,
-    not deep inside kernel construction."""
-    q, k, v = _mk((1, 64, 64, 1, 1, 64, None), jnp.bfloat16)
-    with pytest.raises(ValueError, match="not vendored"):
-        flash_attn(q, k, v, backend="cute", kernel_arch=90)
-    with pytest.raises(ValueError, match="unknown kernel family"):
-        flash_attn(q, k, v, backend="cute", kernel_arch=75)
+    not deep inside kernel construction. The wgmma (sm_90) and tcgen05
+    (sm_100) families each run on exactly one generation, so whichever the
+    device is not gives an unrunnable-but-known family."""
+    from conftest import _real_arch
+
     import fa4_jax
 
-    with fa4_jax.default_kernel_arch(90), pytest.raises(ValueError, match="not vendored"):
+    q, k, v = _mk((1, 64, 64, 1, 1, 64, None), jnp.bfloat16)
+    foreign = 100 if _real_arch() // 10 == 9 else 90
+    with pytest.raises(ValueError, match="need"):
+        flash_attn(q, k, v, backend="cute", kernel_arch=foreign)
+    with pytest.raises(ValueError, match="unknown kernel family"):
+        flash_attn(q, k, v, backend="cute", kernel_arch=75)
+
+    with fa4_jax.default_kernel_arch(foreign), pytest.raises(ValueError, match="need"):
         flash_attn(q, k, v, backend="cute")
 
 

@@ -7,14 +7,21 @@ the copy installed in minimax-music3's venv, which already carried the
 blocks left of the sliding window instead of masking them; upstream marks the
 gap with a bare `# TODO: local`).
 
-The SM80/SM120 (Ampere / consumer-Blackwell) and SM100 (datacenter
-Blackwell: `flash_fwd_sm100.py`, `flash_bwd_sm100.py` and the helpers they
-drag in — `blackwell_helpers.py`, `mma_sm100_desc.py`, `barrier.py`,
-`copy_utils.py`, `fa_logging.py`) forward+backward closures are vendored —
-not the SM90 kernels, the SM100 MLA/hd256-2CTA variants, the torch
-`interface.py`, or the varlen/paged serving extras beyond what the closures
-drag in. The SM100 files were taken from the same 4.0.0b26 wheel
-(re-downloaded from PyPI) with only the import rewrite applied.
+The SM80/SM120 (Ampere / consumer-Blackwell), SM90 (Hopper:
+`flash_fwd_sm90.py`, `flash_bwd_sm90.py`; their helpers — `pipeline.py`,
+`named_barrier.py`, `barrier.py`, `pack_gqa.py`, `paged_kv.py`,
+`block_sparse_utils.py` — were already here, and the wgmma-level helpers
+come from `quack.sm90_utils`) and SM100 (datacenter Blackwell:
+`flash_fwd_sm100.py`, `flash_bwd_sm100.py` and the helpers they drag in —
+`blackwell_helpers.py`, `mma_sm100_desc.py`, `barrier.py`, `copy_utils.py`,
+`fa_logging.py`) forward+backward closures are vendored — not the SM100
+MLA/hd256-2CTA variants, the torch `interface.py`, or the varlen/paged
+serving extras beyond what the closures drag in. The SM100 and SM90 files
+were taken from the same 4.0.0b26 wheel (re-downloaded from PyPI; the SM90
+kernels are byte-identical in the latest release, 4.0.0b29) with the import
+rewrite applied, then the local changes below. `interface.py`'s per-head-dim
+SM90 tile tables (`_tile_size_fwd_sm90` / `_tile_size_bwd_sm90`) are
+reproduced in `fa4_jax/kernels.py`.
 
 ## Local changes
 
@@ -80,6 +87,51 @@ drag in. The SM100 files were taken from the same 4.0.0b26 wheel
   Qt/Kt/dOt paths (unused here) are left raw. The SM80/SM120 family needs
   none of this: its cp.async loads already fold the row predicate in, and a
   false predicate zero-fills.
+
+- `flash_fwd_sm90.py` (Hopper forward): the same three varlen/OOB fixes
+  the other families needed, in this kernel's shape. (1) Varlen K/V TMA
+  loads are ragged (our `copy_utils.create_ragged_tensor_for_tma` +
+  per-sequence `offset_ragged_tensor` in `load`) so rows past `seqused_k`
+  zero-fill instead of loading a partially-used slot's dead padding (NaN
+  there reaches the PV MMA as `0*NaN`; upstream only rags the O *store*,
+  through quack's `ptr_shift` flavor, which is kept). (2) The first K/V
+  load is clamped to block 0: upstream lets the TMA path load block
+  `n_block_max - 1 = -1` when `seqused_k == 0` (or a local band lies
+  entirely left of the keys) on the theory that TMA zero-fills it, but a
+  varlen sequence is a domain offset into the packed tensor, so block -1 is
+  the previous slot's tail. (3) The epilogue's O tile is staged over sV
+  when it does not fit in sQ (upstream always uses sQ, so `head_dim_v >
+  head_dim` overflowed into sK and beyond); sV/sQ/sK are contiguous and
+  every tile is dead by then. Plus a real `can_implement`: the inherited
+  one is the SM80 kernel's (SM80 tile formula against sm_80's 163 KB), so
+  it mirrors `_get_shared_storage_cls` against sm_90's 227 KB and bounds
+  the O tile — upstream's largest configs sit exactly at the limit, and a
+  launch that overflows poisons the CUDA context.
+- `flash_bwd_sm90.py` (Hopper backward): (1) head dims are padded to a
+  multiple of 32 (upstream: 16). `tile_hdim` is also the fp32 accumulator
+  geometry (dQaccum blocks are `tile_m * tile_hdim`, GQA's dK/dV blocks
+  `tile_n * tile_hdim`), and the pre-/postprocess kernels that zero and
+  convert those buffers pad to 32: with 16, head dims that are 16 mod 32
+  (48, 80, 112, ...) had the kernel and the postprocess disagree on every
+  block's offset and on the fragment layout, i.e. garbage dQ (and dK/dV
+  under GQA). Verified on an H100: as shipped, head_dim 80 gives dQ with a
+  max error of 1.2 against the reference (dK/dV, which take the direct TMA
+  store path, are fine); with 32 it matches to bf16 tolerance. (head_dim
+  48 -- and 16 -- fail to *compile* the backward on every family, sm_80
+  included, with a copy-predicate shape mismatch in the shared pre/postprocess
+  path; pre-existing, not touched here.) Upstream's SM100
+  backward pads to 16 too and shares the postprocess, so the same head dims
+  are suspect there (untested here: no sm_100 device). (2) Varlen Q/K/V/dO TMA loads are ragged like the
+  forward's (upstream rags only the dK/dV stores) — `dK = dS^T Q` and
+  `dQ = dS K` multiply the raw operands, so score masking cannot contain
+  NaN padding. (3) `can_implement` replaced: upstream's was never called by
+  its interface and rejects every real config (`2 * tile_m % num_threads`
+  with 384 threads) while checking no SMEM budget; ours takes the
+  constructor's arguments and mirrors `_get_shared_storage_cls` field by
+  field (`smem_usage_bytes`). (4) The dO smem layout's atom width follows
+  `head_dim_v` (upstream: `head_dim`, for both Q and dO) -- with
+  `head_dim_v < head_dim`, e.g. (64, 32), the 64-wide atom cannot tile the
+  dO tile and TMA-atom creation fails at compile time.
 
 ## Updating
 

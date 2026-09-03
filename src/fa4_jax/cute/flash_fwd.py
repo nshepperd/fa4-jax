@@ -1276,6 +1276,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         )
 
 
-# SM90 forward pass moved to flash_fwd_sm90.py; re-export for backward compatibility
-# fa4-jax: the SM90 (Hopper) forward kernel is not vendored; only the
-# SM80/SM120 (Ampere / consumer-Blackwell) family is.
+# SM90 forward pass lives in flash_fwd_sm90.py (fa4-jax: upstream's lazy
+# `__getattr__` re-export of FlashAttentionForwardSm90 from this module is
+# dropped; kernels.py imports it from its own module).

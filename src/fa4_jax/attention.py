@@ -85,17 +85,21 @@ def kernel_arch_unsupported(arch: int, device_arch: int) -> str | None:
     code is always compiled for the real device, so a family can serve
     newer hardware when its instructions exist there: the SM80-MMA kernels
     (cp.async + mma.sync, and tile configs that fit the smallest 99 KB SMEM
-    budget) run on sm_8x, sm_10x/11x, and sm_12x alike; the tcgen05 kernels
-    need datacenter Blackwell.
+    budget) run on sm_8x, sm_90, sm_10x/11x, and sm_12x alike; the wgmma
+    (Hopper) kernels need sm_90 -- wgmma and its setmaxnreg warp
+    specialization exist on no other generation; the tcgen05 kernels need
+    datacenter Blackwell.
     """
     if arch // 10 == 9:
-        return "the SM90 (Hopper) kernels are not vendored"
+        if device_arch // 10 != 9:
+            return "the SM90 (wgmma) kernels need a Hopper (sm_90) device"
+        return None
     if arch // 10 in (10, 11):
         if device_arch // 10 not in (10, 11):
             return "the tcgen05 kernels need a datacenter-Blackwell (sm_10x) device"
         return None
     if arch // 10 in (8, 12):
-        if device_arch // 10 not in (8, 10, 11, 12):
+        if device_arch // 10 not in (8, 9, 10, 11, 12):
             return f"the SM80-MMA kernel family is not supported on sm_{device_arch}"
         return None
     return "unknown kernel family (expected one of 8x, 90, 10x, 12x)"
@@ -541,14 +545,15 @@ def flash_attn(
             or None to pick cute exactly when jax is running on GPU.
         kernel_arch: override which kernel *family* the cute backend uses,
             as a compute capability (e.g. ``80`` for the SM80-MMA kernels,
-            ``120`` for their SM120 variant, ``100`` for tcgen05); ``None``
-            follows the ambient :func:`default_kernel_arch` scope if one is
-            active, else the device. Code is still compiled for the real
-            device — this only selects the implementation, which must be
-            executable there (the SM80/SM120 families run on
-            sm_8x/sm_100/sm_120; tcgen05 needs sm_100). The reference
-            backend ignores it. Used by the test suite to cover every
-            runnable family; also an escape hatch if one family misbehaves.
+            ``120`` for their SM120 variant, ``90`` for the Hopper wgmma
+            kernels, ``100`` for tcgen05); ``None`` follows the ambient
+            :func:`default_kernel_arch` scope if one is active, else the
+            device. Code is still compiled for the real device — this only
+            selects the implementation, which must be executable there (the
+            SM80/SM120 families run on sm_8x/sm_90/sm_100/sm_120; wgmma
+            needs sm_90; tcgen05 needs sm_100). The reference backend
+            ignores it. Used by the test suite to cover every runnable
+            family; also an escape hatch if one family misbehaves.
 
     Returns:
         ``(batch, q_seq, q_heads, head_dim_v)`` in q's dtype, plus the LSE if
