@@ -111,6 +111,25 @@ def sm90_col_to_r2p_idx(col_limit: Int32) -> Int32:
     return col_limit // 8 * 2 + min(col_limit % 8, 2)
 
 
+def _cols_match_r2p(t0ScS_mn: cute.Tensor, COL: int) -> bool:
+    """fa4-jax fix: whether the accumulator columns of thread 0 are exactly
+    0, 1, 8, 9, 16, 17, ... -- the pattern sm90_col_to_r2p_idx assumes.
+
+    An SM80 tiled MMA with more than one warp along N breaks it: the N
+    permutation interleaves the warps' 8-column atoms, so a thread holds
+    e.g. columns 0, 1, 16, 17 and the R2P bitmask lands on the wrong ones
+    (seen as a wrong causal backward with 8 warps, S/dP atoms 4x2). The
+    per-column path only needs every thread's columns to be thread 0's plus
+    a constant offset, which holds for any atom layout. The coordinates are
+    compile-time constants; if one is not, take the per-column path.
+    """
+    for c in range(cute.size(t0ScS_mn.shape[1])):
+        col = t0ScS_mn[0, c][COL]
+        if not isinstance(col, int) or col != c // 2 * 8 + c % 2:
+            return False
+    return True
+
+
 @cute.jit
 def row_to_r2p_idx(x: Int32, num_rep: int, num_wg: int) -> Int32:
     """Convert a row coordinate to an R2P element index in the warp-group interleaved layout.
@@ -201,6 +220,7 @@ class AttentionMask:
         )
         ROW = 0 if const_expr(not self.swap_AB) else 1
         COL = 1 if const_expr(not self.swap_AB) else 0
+        r2p_ok = const_expr(not self.swap_AB and _cols_match_r2p(t0ScS_mn, COL))
         thr_col_offset = tScS_mn[0][COL]
         # To handle edge cases of completely masked out rows where n_block_max = 0,
         # we treat negative n_blocks as 0th n_block
@@ -210,7 +230,7 @@ class AttentionMask:
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
         if const_expr(not mask_causal and not mask_local and mask_mod is None):
             if const_expr(mask_seqlen):
-                r2p = const_expr(not self.swap_AB)
+                r2p = r2p_ok
                 if const_expr(not r2p):
                     # traverse column index.
                     for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
@@ -249,7 +269,7 @@ class AttentionMask:
                     1 + self.seqlen_k - n_block * self.tile_n - self.seqlen_q - thr_col_offset
                 )
                 if const_expr(mask_causal):
-                    r2p = const_expr(not self.swap_AB)  # R2P trick, see apply_mask_sm100
+                    r2p = r2p_ok  # R2P trick, see apply_mask_sm100
                     for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                         # get the column index limit based on current row. Only consider the row index, so the column index sets to 0.
                         if const_expr(self.qhead_per_kvhead_packgqa == 1):
@@ -287,7 +307,7 @@ class AttentionMask:
                         if const_expr(self.window_size_left is not None)
                         else None
                     )
-                    r2p_local = const_expr(not self.swap_AB)
+                    r2p_local = r2p_ok
                     for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                         if const_expr(self.qhead_per_kvhead_packgqa == 1):
                             row_idx = tScS_mn[r, 0][0] + m_block * self.tile_m

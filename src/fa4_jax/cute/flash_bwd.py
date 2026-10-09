@@ -193,7 +193,8 @@ class FlashAttentionBackwardSm80:
         sLSE = round_up(round_up(m_block_size, 64) * num_stages_Q * 4, 128)
         # sP / sdS: (m, n) in the compute dtype.
         sPdS = round_up(m_block_size * n_block_size * width, 128)
-        return sQV + sdO + sK + 2 * sLSE + 2 * sPdS
+        # The struct's size rounds up to its largest member alignment (1024).
+        return round_up(sQV + sdO + sK + 2 * sLSE + 2 * sPdS, 1024)
 
     def _check_type(
         self,
@@ -404,10 +405,12 @@ class FlashAttentionBackwardSm80:
             sdS: sdS_struct
             # TODO: the case where there's no sP
 
+        # fa4-jax fix: no sV field here -- with V_in_regs, sV aliases sQ (see
+        # the allocation below); upstream reserved both, so V_in_regs saved
+        # no SMEM at all.
         @cute.struct
         class SharedStorageSharedQV:
             sK: sK_struct
-            sV: sV_struct
             sQ: sQV_struct
             sdO: sdO_struct
             sLSE: sLSE_struct
@@ -1031,6 +1034,10 @@ class FlashAttentionBackwardSm80:
             smem_copy_params.tdPsV,
             smem_copy_params.smem_thr_copy_QdO, smem_copy_params.smem_thr_copy_KV,
             hook_fn=load_Q_next if cutlass.const_expr(self.num_stages_Q > 1) else None,
+            # fa4-jax fix: with V_in_regs, sV aliases sQ, so V must come from
+            # the registers loaded in the prologue (FA2 passes the same flag);
+            # upstream re-read sV here and got the current Q tile.
+            B_in_regs=self.V_in_regs,
             swap_AB=self.SdP_swapAB,
         )
         tLSErdPsum = cute.make_fragment_like(smem_copy_params.tSsdPsumMma[None, 0])
