@@ -110,10 +110,19 @@ def _fwd_kernel_cls(arch: int):
     )
 
 
-def _fwd_tile_mn(arch: int, head_dim: int) -> tuple[int, int]:
-    """Tile sizes matching flash_attn.cute.interface's per-arch heuristic."""
-    if arch // 10 == 12 and head_dim <= 64:
-        return 128, 128  # 48 KB of the 99 KB SMEM budget
+def _fwd_tile_mn(arch: int, head_dim: int, head_dim_v: int) -> tuple[int, int]:
+    """Tile sizes matching flash_attn.cute.interface's per-arch heuristic,
+    plus a 64x64 tile for sm_12x head dims above 128: 128x64 needs 128 KB of
+    SMEM at hd 256 (and its O accumulator would be 256 fp32 registers per
+    thread), while 64x64 is 96 KB -- FA2's hd256 config on sm86/89. Keyed on
+    the larger head dim since O (head_dim_v wide) drives register pressure."""
+    if arch // 10 == 12:
+        hd = max(head_dim, head_dim_v)
+        if hd <= 64:
+            return 128, 128  # 48 KB of the 99 KB SMEM budget
+        if hd <= 128:
+            return 128, 64
+        return 64, 64
     return 128, 64
 
 
@@ -279,7 +288,7 @@ def _get_fwd(dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, local, mask_
             use_2cta_instrs=False,
             use_clc_scheduler=False,
         )
-    tile_m, tile_n = _fwd_tile_mn(arch, head_dim)
+    tile_m, tile_n = _fwd_tile_mn(arch, head_dim, head_dim_v)
     return _fwd_kernel_cls(arch)(
         dtype,
         head_dim,
@@ -872,7 +881,7 @@ def _can_implement(
                 (c.tile_m // 64 + 1) * 128, causal,
                 Q_in_regs=False, mma_pv_is_rs=c.mma_pv_is_rs, smem_capacity=smem_capacity,
             )
-        tile_m, tile_n = _fwd_tile_mn(arch, head_dim)
+        tile_m, tile_n = _fwd_tile_mn(arch, head_dim, head_dim_v)
         return _fwd_kernel_cls(arch).can_implement(
             dtype, head_dim, head_dim_v, tile_m, tile_n, 1, 128, causal,
             smem_capacity=smem_capacity,
@@ -922,7 +931,8 @@ def _validate(cfg: AttnConfig, kind: str, q, k, v):
             f"FA4 {kind} kernel cannot run head_dim={head_dim}, head_dim_v={head_dim_v} "
             f"({q.dtype}) on sm_{arch}: tile does not fit the shared-memory budget "
             "or the head dims exceed what the kernel supports (<= 128 on "
-            "sm_8x/sm_10x/sm_12x, <= 256 on sm_90)"
+            "sm_8x/sm_10x, <= 256 on sm_90 and for the sm_12x forward; the "
+            "sm_12x backward fits up to 160)"
         )
     return dtype, head_dim, head_dim_v, ratio, arch
 

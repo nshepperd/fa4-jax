@@ -596,7 +596,7 @@ LARGE_HEAD_DIMS = [
     (256, 256),
     (128, 256),  # d_v > d
     (256, 128),  # d > d_v
-    (256, 64),  # bwd fits sm_120 here, fwd does not
+    (256, 64),  # bwd fits sm_120 here (fwd fits via its 64x64 tile)
     (64, 192),
 ]
 
