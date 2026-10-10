@@ -583,15 +583,15 @@ def test_public_surface():
 
 # ---------------------------------------------------------------- head-dim envelope
 #
-# Whether a large / mixed head-dim pair fits is family- AND device-dependent:
-# the SM80-MMA tiles fit hd 256 in sm_80's 163 KB but not in a GeForce's
-# 99 KB, and the tcgen05 kernels stop at 128. The contract is that every
+# Whether a large / mixed head-dim pair fits is device-dependent: the
+# tcgen05 kernels (sm_100) stop at 128, and sm_90 rejects configs whose
+# SMEM doesn't fit. The contract is that every
 # pair either raises the clean "cannot run head_dim" ValueError up front or
 # computes correctly -- never a launch that fails inside CUDA and poisons the
 # context (which would take every later test down with it). Both fwd and bwd
-# have their own SMEM budgets, so both are swept. The SM80-MMA families
-# (sm80, sm120) must actually run all of them, even in 99 KB: the forward via
-# a 64x64 tile, the backward via the smaller-tile rows of _bwd_cfgs_sm80.
+# have their own SMEM budgets, so both are swept. The SM80-MMA devices
+# (sm_8x, sm_12x) must actually run all of them, even in 99 KB: the forward
+# via a 64x64 tile, the backward via the smaller-tile rows of _bwd_cfgs_sm80.
 # s_kv = 150 is a multiple of no kv tile, so the seqlen mask runs on partial
 # tiles.
 
@@ -616,8 +616,10 @@ def _fits_or_rejects(fn, *args):
 
 @pytest.mark.parametrize("d,d_v", LARGE_HEAD_DIMS, ids=lambda x: str(x))
 @pytest.mark.parametrize("causal", [False, True])
-def test_large_head_dims(d, d_v, causal, kernel_arch):
-    run = (lambda fn: fn()) if kernel_arch in (80, 120) else _fits_or_rejects
+def test_large_head_dims(d, d_v, causal):
+    from conftest import _real_arch
+
+    run = (lambda fn: fn()) if _real_arch() // 10 in (8, 12) else _fits_or_rejects
     q, k, v = _mk((1, 96, 150, 2, 1, d, d_v), jnp.bfloat16)
     got = run(lambda: flash_attn(q, k, v, backend="cute", causal=causal))
     if got is not None:
@@ -631,42 +633,3 @@ def test_large_head_dims(d, d_v, causal, kernel_arch):
         got, want = grads
         for g, w, name in zip(got, want, "qkv"):
             assert_close(g, w, dtype=q.dtype, msg=f"d{name}")
-
-
-def test_kernel_arch_validation():
-    """Unrunnable kernel_arch values fail up front with a clear message,
-    not deep inside kernel construction. The wgmma (sm_90) and tcgen05
-    (sm_100) families each run on exactly one generation, so whichever the
-    device is not gives an unrunnable-but-known family."""
-    from conftest import _real_arch
-
-    import fa4_jax
-
-    q, k, v = _mk((1, 64, 64, 1, 1, 64, None), jnp.bfloat16)
-    foreign = 100 if _real_arch() // 10 == 9 else 90
-    with pytest.raises(ValueError, match="need"):
-        flash_attn(q, k, v, backend="cute", kernel_arch=foreign)
-    with pytest.raises(ValueError, match="unknown kernel family"):
-        flash_attn(q, k, v, backend="cute", kernel_arch=75)
-
-    with fa4_jax.default_kernel_arch(foreign), pytest.raises(ValueError, match="need"):
-        flash_attn(q, k, v, backend="cute")
-
-
-def test_kernel_arch_param_overrides_fixture():
-    """The public kernel_arch argument selects the family per call,
-    independent of the device (and of this suite's family fixture): both
-    explicit choices must agree with the reference and with each other."""
-    q, k, v = _mk((1, 200, 200, 2, 1, 64, None), jnp.bfloat16)
-    want = flash_attn(q, k, v, causal=True, backend="reference")
-    outs = {}
-    for arch in (80, 120):
-        outs[arch] = flash_attn(q, k, v, causal=True, backend="cute", kernel_arch=arch)
-        assert_close(outs[arch], want, dtype=q.dtype, msg=f"kernel_arch={arch}")
-    grad80 = jax.grad(
-        lambda q: flash_attn(q, k, v, causal=True, backend="cute", kernel_arch=80).sum()
-    )(q)
-    grad_ref = jax.grad(
-        lambda q: flash_attn(q, k, v, causal=True, backend="reference").sum()
-    )(q)
-    assert_close(grad80, grad_ref, dtype=q.dtype)

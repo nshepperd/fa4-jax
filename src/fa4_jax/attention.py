@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import functools
 import math
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -50,59 +49,7 @@ from jaxtyping import Array, Float
 
 from fa4_jax.masks import MaskMod
 
-__all__ = ["default_kernel_arch", "flash_attn", "flash_attn_varlen"]
-
-
-# ---------------------------------------------------------------- kernel families
-
-# Ambient default for the per-call `kernel_arch` argument (explicit argument
-# wins). Process-global: meant for tests and benchmarks that want every call
-# in a region to use one kernel family without threading the parameter.
-_DEFAULT_KERNEL_ARCH: int | None = None
-
-
-@contextmanager
-def default_kernel_arch(arch: int | None):
-    """Scope a default for ``kernel_arch``: every ``flash_attn`` /
-    ``flash_attn_varlen`` call inside behaves as if ``kernel_arch=arch`` was
-    passed (calls that pass it explicitly are unaffected). Not thread-safe.
-    """
-    global _DEFAULT_KERNEL_ARCH
-    prev = _DEFAULT_KERNEL_ARCH
-    _DEFAULT_KERNEL_ARCH = None if arch is None else int(arch)
-    try:
-        yield
-    finally:
-        _DEFAULT_KERNEL_ARCH = prev
-
-
-def kernel_arch_unsupported(arch: int, device_arch: int) -> str | None:
-    """Why kernel family ``arch`` cannot execute on ``sm_{device_arch}``, or
-    None if it can. The single source of truth for the runtime validation in
-    the cute backend and the test suite's per-family skip logic.
-
-    A family is the *implementation* (instruction mix, schedules, tiles);
-    code is always compiled for the real device, so a family can serve
-    newer hardware when its instructions exist there: the SM80-MMA kernels
-    (cp.async + mma.sync, and tile configs that fit the smallest 99 KB SMEM
-    budget) run on sm_8x, sm_90, sm_10x/11x, and sm_12x alike; the wgmma
-    (Hopper) kernels need sm_90 -- wgmma and its setmaxnreg warp
-    specialization exist on no other generation; the tcgen05 kernels need
-    datacenter Blackwell.
-    """
-    if arch // 10 == 9:
-        if device_arch // 10 != 9:
-            return "the SM90 (wgmma) kernels need a Hopper (sm_90) device"
-        return None
-    if arch // 10 in (10, 11):
-        if device_arch // 10 not in (10, 11):
-            return "the tcgen05 kernels need a datacenter-Blackwell (sm_10x) device"
-        return None
-    if arch // 10 in (8, 12):
-        if device_arch // 10 not in (8, 9, 10, 11, 12):
-            return f"the SM80-MMA kernel family is not supported on sm_{device_arch}"
-        return None
-    return "unknown kernel family (expected one of 8x, 90, 10x, 12x)"
+__all__ = ["flash_attn", "flash_attn_varlen"]
 
 
 @dataclass(frozen=True)
@@ -127,9 +74,6 @@ class AttnConfig:
     mask: jax.tree_util.PyTreeDef | None
     backend: str
     varlen: bool = False
-    # Kernel-family override for the cute backend (e.g. 80 to run the
-    # SM80-MMA kernels on newer hardware); None = follow the device.
-    kernel_arch: int | None = None
     # Varlen only: give unused rows (beyond seqused, or in cu_seqlens gaps)
     # defined values — 0 in out/tangent/gradients, -inf in the LSE — instead
     # of unspecified memory. Costs one buffer fill per output on the cute
@@ -474,7 +418,7 @@ def _check_qkv(q, k, v):
 
 
 def _make_config(
-    q, causal, window_size, scale, mask_def, backend, varlen, kernel_arch,
+    q, causal, window_size, scale, mask_def, backend, varlen,
     defined_padding=False,
 ):
     left, right = window_size if window_size is not None else (None, None)
@@ -483,8 +427,6 @@ def _make_config(
         None if left is None else int(left),
         None if right is None else int(right),
     )
-    if kernel_arch is None:
-        kernel_arch = _DEFAULT_KERNEL_ARCH
     return AttnConfig(
         causal=causal,
         local=local,
@@ -493,7 +435,6 @@ def _make_config(
         mask=mask_def,
         backend=backend if backend is not None else _default_backend(),
         varlen=varlen,
-        kernel_arch=None if kernel_arch is None else int(kernel_arch),
         defined_padding=bool(defined_padding),
     )
 
@@ -509,7 +450,6 @@ def flash_attn(
     mask_mod: MaskMod | None = None,
     return_lse: bool = False,
     backend: str | None = None,
-    kernel_arch: int | None = None,
 ):
     """FlashAttention-4 with reverse- and forward-mode differentiation.
 
@@ -542,18 +482,9 @@ def flash_attn(
         return_lse: also return the row log-sum-exp ``(batch, heads, q_seq)``
             (float32, natural log; ``-inf`` for rows with no visible key).
         backend: ``"cute"`` (FA4 kernels, CUDA), ``"reference"`` (plain jnp),
-            or None to pick cute exactly when jax is running on GPU.
-        kernel_arch: override which kernel *family* the cute backend uses,
-            as a compute capability (e.g. ``80`` for the SM80-MMA kernels,
-            ``120`` for their SM120 variant, ``90`` for the Hopper wgmma
-            kernels, ``100`` for tcgen05); ``None`` follows the ambient
-            :func:`default_kernel_arch` scope if one is active, else the
-            device. Code is still compiled for the real device — this only
-            selects the implementation, which must be executable there (the
-            SM80/SM120 families run on sm_8x/sm_90/sm_100/sm_120; wgmma
-            needs sm_90; tcgen05 needs sm_100). The reference backend
-            ignores it. Used by the test suite to cover every runnable
-            family; also an escape hatch if one family misbehaves.
+            or None to pick cute exactly when jax is running on GPU. The
+            cute backend runs the device's own kernels: SM80-MMA on sm_8x
+            and sm_12x, wgmma on sm_90, tcgen05 on sm_100.
 
     Returns:
         ``(batch, q_seq, q_heads, head_dim_v)`` in q's dtype, plus the LSE if
@@ -565,7 +496,7 @@ def flash_attn(
         raise ValueError(f"batch mismatch: q {q.shape[0]} vs kv {k.shape[0]}")
     _check_qkv(q, k, v)
     aux_tensors, mask_def = _flatten_mask(mask_mod)
-    cfg = _make_config(q, causal, window_size, scale, mask_def, backend, varlen=False, kernel_arch=kernel_arch)
+    cfg = _make_config(q, causal, window_size, scale, mask_def, backend, varlen=False)
     res = fa4_fwd_p.bind(q, k, v, *aux_tensors, cfg=cfg, need_lse=return_lse)
     return (res[0], res[1]) if return_lse else res[0]
 
@@ -585,7 +516,6 @@ def flash_attn_varlen(
     mask_mod: MaskMod | None = None,
     return_lse: bool = False,
     backend: str | None = None,
-    kernel_arch: int | None = None,
     defined_padding: bool = False,
 ):
     """Variable-length (packed / ragged) FlashAttention-4.
@@ -627,7 +557,6 @@ def flash_attn_varlen(
             ``(q_heads, total_q)`` (float32, natural log, ``-inf`` for rows
             with no visible key).
         backend: as in :func:`flash_attn`.
-        kernel_arch: as in :func:`flash_attn`.
         defined_padding: unused rows — beyond ``seqused``, or tokens not
             covered by any sequence — are normally *unspecified* in the
             outputs and their gradients. With ``True`` they are defined:
@@ -691,7 +620,7 @@ def flash_attn_varlen(
     aux_tensors, mask_def = _flatten_mask(mask_mod)
     cfg = _make_config(
         q, causal, window_size, scale, mask_def, backend, varlen=True,
-        kernel_arch=kernel_arch, defined_padding=defined_padding,
+        defined_padding=defined_padding,
     )
     res = fa4_fwd_p.bind(
         q, k, v, cu_seqlens_q, cu_seqlens_k, *seqused, *aux_tensors,

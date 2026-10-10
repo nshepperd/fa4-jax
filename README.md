@@ -116,22 +116,10 @@ block sparsity, which is not wired up.
 uv run pytest              # kernels vs the jnp reference (fwd/grad/jvp/masks) + API checks; needs a CUDA device
 ```
 
-Every kernel-facing test is parametrized over the vendored kernel families
-(`sm80`/`sm90`/`sm100`/`sm120` test ids) and runs each one the device can
-actually execute — e.g. a B200 runs the SM80-MMA and SM120 variants as well
-as the native tcgen05 kernels, and an H100 runs them next to the native wgmma
-kernels, since cp.async/mma.sync exist there too. The rest show up as skips,
-so reports state exactly which implementations have coverage (`sm90` needs a
-Hopper device, `sm100` a datacenter Blackwell). `FA4_TEST_ARCHS=sm100` (comma
-list) restricts the sweep for quick iterations; the same selection is
-available to users as `flash_attn(..., kernel_arch=80)`.
-
-Run the all-family sweep as **one pytest process per family**
-(`FA4_TEST_ARCHS=sm80 uv run pytest`, then `sm120`, then `sm100`): each
-compiled kernel variant registers a JAX FFI target and jax-tvm-ffi caps a
-process at 1024 handlers — three families of kernels in one process blow
-through it mid-run and everything after fails with
-`cannot register more than 1024 handlers`.
+Kernel-facing tests run the device's own kernels: SM80-MMA on sm_8x and
+sm_12x, wgmma on sm_90, tcgen05 on sm_100 (the latter two backwards fall
+back to SM80-MMA for configs their native kernels can't take). Covering every
+generation means running the suite on each kind of hardware.
 
 `conftest.py` sets `XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async` and
-`XLA_PYTHON_CLIENT_MEM_FRACTION=0.4` so the suite shares the GPU.
+`XLA_PYTHON_CLIENT_MEM_FRACTION=0.2` so the suite shares the GPU.

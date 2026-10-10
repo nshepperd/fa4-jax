@@ -117,9 +117,9 @@ def _fwd_tile_mn(arch: int, dtype, head_dim: int, head_dim_v: int) -> tuple[int,
     thread), while 64x64 is 96 KB -- FA2's hd256 config on sm86/89.
 
     sm_12x switches on the larger head dim (O, head_dim_v wide, drives
-    register pressure). The sm_8x family keeps 128x64 wherever it fits the
-    resident device -- sm_80's 163 KB takes it up to hd 256 -- and drops to
-    64x64 where it doesn't (sm_86/89, or the family run on a 99 KB part)."""
+    register pressure). sm_8x keeps 128x64 wherever it fits -- sm_80's
+    163 KB takes it up to hd 256 -- and drops to 64x64 where it doesn't
+    (sm_86/89)."""
     if arch // 10 == 12:
         hd = max(head_dim, head_dim_v)
         if hd <= 64:
@@ -130,7 +130,7 @@ def _fwd_tile_mn(arch: int, dtype, head_dim: int, head_dim_v: int) -> tuple[int,
     if arch // 10 == 8:
         import cutlass.utils as utils_basic
 
-        smem = utils_basic.get_smem_capacity_in_bytes(f"sm_{_device_arch()}")
+        smem = utils_basic.get_smem_capacity_in_bytes(f"sm_{arch}")
         if not _fwd_kernel_cls(arch).can_implement(
             dtype, head_dim, head_dim_v, 128, 64, 1, 128, False, smem_capacity=smem
         ):
@@ -496,9 +496,9 @@ def _bwd_kernel_cls(arch: int):
 
 @functools.cache
 def _bwd_plan(
-    dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, local, arch, device
+    dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, local, arch
 ) -> _BwdPlan | None:
-    """Pick the backward kernel for (family ``arch``, resident ``device``), or
+    """Pick the backward kernel for device ``sm_{arch}``, or
     None if nothing fits (the caller raises a clean ValueError).
 
     - sm_100: the 1-CTA tcgen05 kernel takes head dims up to 128, but
@@ -513,7 +513,7 @@ def _bwd_plan(
     """
     import cutlass.utils as utils_basic
 
-    smem = utils_basic.get_smem_capacity_in_bytes(f"sm_{device}")
+    smem = utils_basic.get_smem_capacity_in_bytes(f"sm_{arch}")
     if arch // 10 == 10 and head_dim == head_dim_v and head_dim <= 128:
         # No can_implement on the tcgen05 backward; the head-dim bound above
         # is its envelope and the constructor asserts the rest.
@@ -830,9 +830,7 @@ def _fa4_bwd_post_dv_varlen_dp(stream, tree, mdVaccum, cu_k, su_k, _mdV_in, mdV)
 
 @functools.cache
 def _get_jvp(dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, local, mask_mod, n_aux):
-    # No arch key: the one SM80-style tangent kernel serves every family
-    # (keeping it out of the cache key shares the compile across kernel_arch
-    # overrides).
+    # No arch key: the one SM80-style tangent kernel serves every device.
     from fa4_jax.cute.flash_jvp import FlashAttentionJvpSm80
 
     # Six tensor tiles must fit where the forward keeps three; halve tile_m
@@ -902,7 +900,7 @@ def _get_static(cfg: AttnConfig, dtype, head_dim, head_dim_v, qhead_per_kvhead, 
         )
     elif kind == "bwd":
         plan = _bwd_plan(
-            dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, local, arch, _device_arch()
+            dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, local, arch
         )
         assert plan is not None, "unreachable: _validate checked _can_implement"
         st["bwd"] = _get_bwd(
@@ -926,20 +924,18 @@ def _get_static(cfg: AttnConfig, dtype, head_dim, head_dim_v, qhead_per_kvhead, 
 @functools.cache
 def _can_implement(
     kind: str, dtype, head_dim: int, head_dim_v: int, qhead_per_kvhead: int,
-    causal: bool, local: bool, arch: int, device: int,
+    causal: bool, local: bool, arch: int,
 ) -> bool:
     """Ask the kernel class whether our tile config fits (SMEM budget, head
     dim limits); a launch that overflows SMEM would otherwise fail *inside*
     CUDA and leave the context in an error state.
 
-    ``arch`` is the kernel family, ``device`` the real GPU (they differ under
-    a kernel_arch override). The family fixes the SMEM *formula*; the budget
-    is always the resident device's -- the SM80-MMA classes default to
+    The budget is always passed explicitly: the SM80-MMA classes default to
     sm_80's 163 KB, which is wrong for every consumer part (sm_86/89/120
-    have 99 KB) whether or not it was reached through an override."""
+    have 99 KB)."""
     import cutlass.utils as utils_basic
 
-    smem_capacity = utils_basic.get_smem_capacity_in_bytes(f"sm_{device}")
+    smem_capacity = utils_basic.get_smem_capacity_in_bytes(f"sm_{arch}")
     if kind == "fwd":
         if arch // 10 == 10:
             # The tcgen05 forward has no can_implement; keep the family's
@@ -961,7 +957,7 @@ def _can_implement(
             smem_capacity=smem_capacity,
         )
     if kind == "bwd":
-        plan = _bwd_plan(dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, local, arch, device)
+        plan = _bwd_plan(dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, local, arch)
         return plan is not None
     if kind == "jvp":
         from fa4_jax.cute.flash_jvp import FlashAttentionJvpSm80
@@ -980,26 +976,15 @@ def _validate(cfg: AttnConfig, kind: str, q, k, v):
     head_dim, head_dim_v = q.shape[-1], v.shape[-1]
     if head_dim % 8 or head_dim_v % 8:
         raise ValueError(f"head dims must be multiples of 8, got {head_dim}, {head_dim_v}")
-    # kernel_arch picks the kernel *family* only; codegen always targets the
-    # real device (the classes read it via the DSL's arch enum), which is
-    # what lets e.g. the SM80-MMA kernels run on sm_100. Validate overrides
-    # up front: an unrunnable family would otherwise die deep inside kernel
-    # construction with an opaque assert.
-    device = _device_arch()
-    if cfg.kernel_arch is not None:
-        from fa4_jax.attention import kernel_arch_unsupported
-
-        reason = kernel_arch_unsupported(cfg.kernel_arch, device)
-        if reason is not None:
-            raise ValueError(
-                f"kernel_arch={cfg.kernel_arch}: {reason} (device is sm_{device})"
-            )
-        arch = cfg.kernel_arch
-    else:
-        arch = device
+    # Each device runs its own kernel family: SM80-MMA on sm_8x/sm_12x, wgmma
+    # on sm_90, tcgen05 on sm_10x (the latter two fall back to the SM80-MMA
+    # backward for configs their native kernels can't take; see _bwd_plan).
+    arch = _device_arch()
+    if arch // 10 not in (8, 9, 10, 11, 12):
+        raise ValueError(f"the FA4 kernels need sm_80 or newer, got sm_{arch}")
     ratio = q.shape[-2] // k.shape[-2]
     if not _can_implement(
-        kind, dtype, head_dim, head_dim_v, ratio, cfg.causal, cfg.local, arch, device
+        kind, dtype, head_dim, head_dim_v, ratio, cfg.causal, cfg.local, arch
     ):
         raise ValueError(
             f"FA4 {kind} kernel cannot run head_dim={head_dim}, head_dim_v={head_dim_v} "
@@ -1129,7 +1114,7 @@ class CuteBackend:
         d_pad = _round_up(d, 32)
         f32 = jnp.float32
         dtype, hd, hdv, ratio, arch = _validate(cfg, "bwd", q, k, v)
-        plan = _bwd_plan(dtype, hd, hdv, ratio, cfg.causal, cfg.local, arch, _device_arch())
+        plan = _bwd_plan(dtype, hd, hdv, ratio, cfg.causal, cfg.local, arch)
         s_q_pad = _round_up(s_q, plan.tile_m)
         st = _get_static(cfg, dtype, hd, hdv, ratio, arch, "bwd")
 
@@ -1223,7 +1208,7 @@ class CuteBackend:
         n_batch = cu_q.shape[0] - 1
         d_pad = _round_up(d, 32)
         dtype, hd, hdv, ratio, arch = _validate(cfg, "bwd", q, k, v)
-        plan = _bwd_plan(dtype, hd, hdv, ratio, cfg.causal, cfg.local, arch, _device_arch())
+        plan = _bwd_plan(dtype, hd, hdv, ratio, cfg.causal, cfg.local, arch)
         s_q_pad = _round_up(total_q, plan.tile_m) + n_batch * plan.tile_m
         st = _get_static(cfg, dtype, hd, hdv, ratio, arch, "bwd")
 

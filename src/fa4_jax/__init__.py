@@ -22,7 +22,7 @@ cutejax) load lazily on first GPU-backend call, so the reference backend and
 the unit tests work on machines with no GPU stack at all.
 """
 
-from fa4_jax.attention import default_kernel_arch, flash_attn, flash_attn_varlen
+from fa4_jax.attention import flash_attn, flash_attn_varlen
 from fa4_jax.masks import (
     FnMask,
     MaskMod,
@@ -40,7 +40,6 @@ __all__ = [
     "MaskMod",
     "and_masks",
     "causal_mask",
-    "default_kernel_arch",
     "document_mask",
     "flash_attn",
     "flash_attn_varlen",
