@@ -79,12 +79,12 @@ backward and forward mode the fused varlen tangent kernel; `vmap` over a
 varlen call is rejected — the packing *is* the batch.
 
 Restrictions (kernel-side, all checked with clear errors): fp16/bf16, head_dim
-a multiple of 8 and ≤ 128 (the SM80/SM120 tile budget; on sm_100, larger heads
-would need 2-CTA MMAs, i.e. cluster launches, which this wrapper doesn't do) —
-≤ 256 on sm_90, where the tiles come from upstream's per-head-dim table and a
-config is rejected only when its shared memory doesn't fit, and ≤ 256 for the
-sm_120 forward and backward (smaller tiles above 128: 64×64 forward, 64×32
-backward; forward-mode stays ≤ 128 there) — no cotangent
+a multiple of 8 and ≤ 256 — on the 99 KB parts (sm_86/89, sm_120) via smaller
+tiles above 128 (64×64 forward, 64×32 backward); on sm_90 the tiles come from
+upstream's per-head-dim table and a config is rejected only when its shared
+memory doesn't fit. Two exceptions stay at ≤ 128: sm_100, where larger heads
+would need 2-CTA MMAs, i.e. cluster launches, which this wrapper doesn't do,
+and forward-mode (JVP), whose six tiles don't fit 99 KB beyond that — no cotangent
 through `lse` in reverse mode. GQA works in all three passes (the backward
 accumulates dK/dV in fp32 across the q heads of each kv head). On sm_100 the
 backward runs the tcgen05 kernel for equal head dims and falls back to the

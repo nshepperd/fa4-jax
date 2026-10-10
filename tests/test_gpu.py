@@ -589,13 +589,15 @@ def test_public_surface():
 # pair either raises the clean "cannot run head_dim" ValueError up front or
 # computes correctly -- never a launch that fails inside CUDA and poisons the
 # context (which would take every later test down with it). Both fwd and bwd
-# have their own SMEM budgets, so both are swept. The sm_120 family must
-# actually run all of them: the forward via its 64x64 tile, the backward via
-# the smaller-tile_n rows of _bwd_cfgs_sm80. s_kv = 150 is a multiple of no
-# kv tile, so the seqlen mask runs on partial tiles.
+# have their own SMEM budgets, so both are swept. The SM80-MMA families
+# (sm80, sm120) must actually run all of them, even in 99 KB: the forward via
+# a 64x64 tile, the backward via the smaller-tile rows of _bwd_cfgs_sm80.
+# s_kv = 150 is a multiple of no kv tile, so the seqlen mask runs on partial
+# tiles.
 
 LARGE_HEAD_DIMS = [
-    (192, 192),  # bwd: 64x32, 4 warps
+    (192, 192),  # bwd: 64x32, 8 warps (2x4 dK/dV warp grid)
+    (224, 224),  # bwd: 32x32 -- the 64-wide rows don't tile 224
     (256, 256),  # bwd: 64x32, 8 warps, V in registers
     (128, 256),  # d_v > d
     (256, 128),  # d > d_v
@@ -615,7 +617,7 @@ def _fits_or_rejects(fn, *args):
 @pytest.mark.parametrize("d,d_v", LARGE_HEAD_DIMS, ids=lambda x: str(x))
 @pytest.mark.parametrize("causal", [False, True])
 def test_large_head_dims(d, d_v, causal, kernel_arch):
-    run = (lambda fn: fn()) if kernel_arch == 120 else _fits_or_rejects
+    run = (lambda fn: fn()) if kernel_arch in (80, 120) else _fits_or_rejects
     q, k, v = _mk((1, 96, 150, 2, 1, d, d_v), jnp.bfloat16)
     got = run(lambda: flash_attn(q, k, v, backend="cute", causal=causal))
     if got is not None:

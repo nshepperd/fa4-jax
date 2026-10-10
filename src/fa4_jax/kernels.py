@@ -110,12 +110,16 @@ def _fwd_kernel_cls(arch: int):
     )
 
 
-def _fwd_tile_mn(arch: int, head_dim: int, head_dim_v: int) -> tuple[int, int]:
+def _fwd_tile_mn(arch: int, dtype, head_dim: int, head_dim_v: int) -> tuple[int, int]:
     """Tile sizes matching flash_attn.cute.interface's per-arch heuristic,
-    plus a 64x64 tile for sm_12x head dims above 128: 128x64 needs 128 KB of
-    SMEM at hd 256 (and its O accumulator would be 256 fp32 registers per
-    thread), while 64x64 is 96 KB -- FA2's hd256 config on sm86/89. Keyed on
-    the larger head dim since O (head_dim_v wide) drives register pressure."""
+    plus a 64x64 tile for large head dims on 99 KB parts: 128x64 needs 128 KB
+    of SMEM at hd 256 (and its O accumulator would be 256 fp32 registers per
+    thread), while 64x64 is 96 KB -- FA2's hd256 config on sm86/89.
+
+    sm_12x switches on the larger head dim (O, head_dim_v wide, drives
+    register pressure). The sm_8x family keeps 128x64 wherever it fits the
+    resident device -- sm_80's 163 KB takes it up to hd 256 -- and drops to
+    64x64 where it doesn't (sm_86/89, or the family run on a 99 KB part)."""
     if arch // 10 == 12:
         hd = max(head_dim, head_dim_v)
         if hd <= 64:
@@ -123,6 +127,14 @@ def _fwd_tile_mn(arch: int, head_dim: int, head_dim_v: int) -> tuple[int, int]:
         if hd <= 128:
             return 128, 64
         return 64, 64
+    if arch // 10 == 8:
+        import cutlass.utils as utils_basic
+
+        smem = utils_basic.get_smem_capacity_in_bytes(f"sm_{_device_arch()}")
+        if not _fwd_kernel_cls(arch).can_implement(
+            dtype, head_dim, head_dim_v, 128, 64, 1, 128, False, smem_capacity=smem
+        ):
+            return 64, 64
     return 128, 64
 
 
@@ -288,7 +300,7 @@ def _get_fwd(dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, local, mask_
             use_2cta_instrs=False,
             use_clc_scheduler=False,
         )
-    tile_m, tile_n = _fwd_tile_mn(arch, head_dim, head_dim_v)
+    tile_m, tile_n = _fwd_tile_mn(arch, dtype, head_dim, head_dim_v)
     return _fwd_kernel_cls(arch)(
         dtype,
         head_dim,
@@ -399,6 +411,23 @@ class _BwdCfgSm80:
     num_stages: int  # for both Q and dO
 
 
+def _bwd_cfg_sm80_tiles(c: _BwdCfgSm80, head_dim: int, head_dim_v: int) -> bool:
+    """Whether the row's three tiled MMAs (warps laid out per its atom
+    layouts, 16x16 per warp, as FlashAttentionBackwardSm80 builds them) tile
+    the problem: S/dP over (tile_m, tile_n), dK/dV over (tile_n, head dims),
+    dQ over (tile_m, head_dim). Head dims are the kernel's 32-padded ones.
+    A row that doesn't tile fails at compile time, not in can_implement."""
+    warps = c.num_threads // 32
+    hd, hdv = _round_up(head_dim, 32), _round_up(head_dim_v, 32)
+    sdp_m, dkv_m, dq_m = (16 * a for a in (c.AtomLayoutMSdP, c.AtomLayoutNdKV, c.AtomLayoutMdQ))
+    sdp_n, dkv_n, dq_n = (16 * (warps // a) for a in (c.AtomLayoutMSdP, c.AtomLayoutNdKV, c.AtomLayoutMdQ))
+    return (
+        c.tile_m % sdp_m == 0 and c.tile_n % sdp_n == 0
+        and c.tile_n % dkv_m == 0 and hd % dkv_n == 0 and hdv % dkv_n == 0
+        and c.tile_m % dq_m == 0 and hd % dq_n == 0
+    )
+
+
 def _bwd_cfgs_sm80(head_dim: int, head_dim_v: int) -> tuple[_BwdCfgSm80, ...]:
     """Candidate SM80-MMA backward configs, best first; _bwd_plan takes the
     first that fits the device's SMEM.
@@ -407,15 +436,20 @@ def _bwd_cfgs_sm80(head_dim: int, head_dim_v: int) -> tuple[_BwdCfgSm80, ...]:
     Past that, FA2's sm86/89 hd256 config: 64x32, 8 warps, V held in
     registers so sV can alias sQ (1.91 ms vs 2.47 ms for 64x16 on the
     Qwen3.5-9B hd256 fwd+bwd, sm_120, s=2048). Its dK/dV MMA spans 8x16 = 128
-    head-dim columns, so both padded head dims must be multiples of 128 --
-    hd 192 takes 64x32 / 4 warps instead (4 warps with V in registers
-    spills: 2.94 ms). 64x16 is the last resort."""
-    rows = [_BwdCfgSm80(64, 64, 128, 4, 4, 4, False, 2 if head_dim <= 64 else 1)]
-    if _round_up(head_dim, 32) % 128 == 0 and _round_up(head_dim_v, 32) % 128 == 0:
-        rows.append(_BwdCfgSm80(64, 32, 256, 4, 1, 2, True, 1))
-    rows.append(_BwdCfgSm80(64, 32, 128, 4, 2, 4, False, 1))
-    rows.append(_BwdCfgSm80(64, 16, 128, 4, 1, 4, False, 1))
-    return tuple(rows)
+    head-dim columns, so it needs head dims that are multiples of 128; hd 192
+    takes 64x32 / 8 warps with V in SMEM and a 2x4 dK/dV warp grid (1.33 ms
+    vs 1.66 ms for 64x32 / 4 warps, hd192 fwd+bwd on sm_120 -- and 64x32
+    with 4 warps fails libNVVM on sm_86 for every hd above 128, and spills
+    with V in registers). 64x16 / 4 warps, then 32x32,
+    are the last resorts; rows that don't tile the head dims are skipped."""
+    rows = (
+        _BwdCfgSm80(64, 64, 128, 4, 4, 4, False, 2 if head_dim <= 64 else 1),
+        _BwdCfgSm80(64, 32, 256, 4, 1, 2, True, 1),
+        _BwdCfgSm80(64, 32, 256, 4, 2, 2, False, 1),
+        _BwdCfgSm80(64, 16, 128, 4, 1, 4, False, 1),
+        _BwdCfgSm80(32, 32, 128, 2, 2, 2, False, 1),
+    )
+    return tuple(c for c in rows if _bwd_cfg_sm80_tiles(c, head_dim, head_dim_v))
 
 
 @dataclass(frozen=True)
@@ -921,7 +955,7 @@ def _can_implement(
                 (c.tile_m // 64 + 1) * 128, causal,
                 Q_in_regs=False, mma_pv_is_rs=c.mma_pv_is_rs, smem_capacity=smem_capacity,
             )
-        tile_m, tile_n = _fwd_tile_mn(arch, head_dim, head_dim_v)
+        tile_m, tile_n = _fwd_tile_mn(arch, dtype, head_dim, head_dim_v)
         return _fwd_kernel_cls(arch).can_implement(
             dtype, head_dim, head_dim_v, tile_m, tile_n, 1, 128, causal,
             smem_capacity=smem_capacity,
@@ -970,8 +1004,8 @@ def _validate(cfg: AttnConfig, kind: str, q, k, v):
         raise ValueError(
             f"FA4 {kind} kernel cannot run head_dim={head_dim}, head_dim_v={head_dim_v} "
             f"({q.dtype}) on sm_{arch}: tile does not fit the shared-memory budget "
-            "or the head dims exceed what the kernel supports (<= 128 on "
-            "sm_8x/sm_10x and for the sm_12x JVP, <= 256 on sm_90 and sm_12x)"
+            "or the head dims exceed what the kernel supports (<= 256; <= 128 "
+            "on sm_10x and for forward-mode/JVP)"
         )
     return dtype, head_dim, head_dim_v, ratio, arch
 
