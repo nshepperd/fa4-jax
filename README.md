@@ -83,8 +83,8 @@ a multiple of 8 and ≤ 128 (the SM80/SM120 tile budget; on sm_100, larger heads
 would need 2-CTA MMAs, i.e. cluster launches, which this wrapper doesn't do) —
 ≤ 256 on sm_90, where the tiles come from upstream's per-head-dim table and a
 config is rejected only when its shared memory doesn't fit, and ≤ 256 for the
-sm_120 forward (a 64×64 tile above 128; the backward there fits only up to
-160) — no cotangent
+sm_120 forward and backward (smaller tiles above 128: 64×64 forward, 64×32
+backward; forward-mode stays ≤ 128 there) — no cotangent
 through `lse` in reverse mode. GQA works in all three passes (the backward
 accumulates dK/dV in fp32 across the q heads of each kv head). On sm_100 the
 backward runs the tcgen05 kernel for equal head dims and falls back to the

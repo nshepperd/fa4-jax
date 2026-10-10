@@ -376,11 +376,46 @@ def _fa4_fwd_lse(stream, tree, mO, mLSE):
 # Tile config: upstream has no sm_8x branch for the backward -- arch 8 falls
 # through to the SM100 settings, which ask for 128x128 tiles that will not fit
 # sm_86's 100 KB of SMEM. We use the SM120 config (64x64, 128 threads) on both
-# sm_8x and sm_120 instead: conservative, fits everywhere, and it is the only
-# one upstream actually tunes for an SM80-MMA kernel. SM100 (tcgen05) uses
-# upstream's 128x128; SM90 (wgmma) its per-head-dim table (_bwd_cfg_sm90).
-_BWD_NUM_THREADS = 128
-_BWD_ATOM_LAYOUT = 4
+# sm_8x and sm_120 instead: conservative, and it is the only one upstream
+# actually tunes for an SM80-MMA kernel. It stops at head dim ~160 on 99 KB
+# parts, so larger heads step down a ladder of smaller-tile_n rows
+# (_bwd_cfgs_sm80). SM100 (tcgen05) uses upstream's 128x128; SM90 (wgmma)
+# its per-head-dim table (_bwd_cfg_sm90).
+_BWD_NUM_THREADS = 128  # the tcgen05 postprocess's thread count
+
+
+@dataclass(frozen=True)
+class _BwdCfgSm80:
+    """One SM80-MMA backward config. The atom layouts give the warps along M
+    for the S/dP and dQ MMAs and along N (the kv tile) for dK/dV."""
+
+    tile_m: int
+    tile_n: int
+    num_threads: int
+    AtomLayoutMSdP: int
+    AtomLayoutNdKV: int
+    AtomLayoutMdQ: int
+    V_in_regs: bool
+    num_stages: int  # for both Q and dO
+
+
+def _bwd_cfgs_sm80(head_dim: int, head_dim_v: int) -> tuple[_BwdCfgSm80, ...]:
+    """Candidate SM80-MMA backward configs, best first; _bwd_plan takes the
+    first that fits the device's SMEM.
+
+    64x64 / 4 warps is the long-standing default (fits hd <= 160 in 99 KB).
+    Past that, FA2's sm86/89 hd256 config: 64x32, 8 warps, V held in
+    registers so sV can alias sQ (1.91 ms vs 2.47 ms for 64x16 on the
+    Qwen3.5-9B hd256 fwd+bwd, sm_120, s=2048). Its dK/dV MMA spans 8x16 = 128
+    head-dim columns, so both padded head dims must be multiples of 128 --
+    hd 192 takes 64x32 / 4 warps instead (4 warps with V in registers
+    spills: 2.94 ms). 64x16 is the last resort."""
+    rows = [_BwdCfgSm80(64, 64, 128, 4, 4, 4, False, 2 if head_dim <= 64 else 1)]
+    if _round_up(head_dim, 32) % 128 == 0 and _round_up(head_dim_v, 32) % 128 == 0:
+        rows.append(_BwdCfgSm80(64, 32, 256, 4, 1, 2, True, 1))
+    rows.append(_BwdCfgSm80(64, 32, 128, 4, 2, 4, False, 1))
+    rows.append(_BwdCfgSm80(64, 16, 128, 4, 1, 4, False, 1))
+    return tuple(rows)
 
 
 @dataclass(frozen=True)
@@ -392,13 +427,15 @@ class _BwdPlan:
     ``family`` is 100 (tcgen05), 90 (wgmma) or 80 (the SM80-MMA kernel:
     native on sm_8x/sm_12x, and the fallback on sm_90/sm_100 for head configs
     their native kernels cannot take -- cp.async and mma.sync exist there
-    too). The wgmma family carries its full config row in ``sm90``.
+    too). The wgmma and SM80-MMA families carry their full config row in
+    ``sm90`` / ``sm80``.
     """
 
     family: int
     tile_m: int
     tile_n: int
     sm90: _BwdCfgSm90 | None = None
+    sm80: _BwdCfgSm80 | None = None
 
 
 def _round_up(x: int, to: int) -> int:
@@ -437,7 +474,8 @@ def _bwd_plan(
       when its SharedStorage fits the device (upstream's largest configs sit
       exactly at the 227 KB limit) and the config is legal (GQA needs equal
       head dims); otherwise the SM80-MMA fallback.
-    - else the SM80-MMA kernel, if its 64x64 tiles fit the device's SMEM.
+    - else the SM80-MMA kernel, with the first _bwd_cfgs_sm80 row whose
+      SharedStorage fits the device.
     """
     import cutlass.utils as utils_basic
 
@@ -455,13 +493,12 @@ def _bwd_plan(
             **_sm90_bwd_kwargs(c, causal, local), smem_capacity=smem,
         ):
             return _BwdPlan(90, c.tile_m, c.tile_n, c)
-    tile = 64
-    stages = 2 if head_dim <= 64 else 1
-    if _bwd_kernel_cls(arch).can_implement(
-        dtype, head_dim, head_dim_v, tile, tile, stages, stages,
-        _BWD_NUM_THREADS, causal, smem_capacity=smem,
-    ):
-        return _BwdPlan(80, tile, tile)
+    for c in _bwd_cfgs_sm80(head_dim, head_dim_v):
+        if _bwd_kernel_cls(arch).can_implement(
+            dtype, head_dim, head_dim_v, c.tile_m, c.tile_n, c.num_stages, c.num_stages,
+            c.num_threads, causal, V_in_regs=c.V_in_regs, smem_capacity=smem,
+        ):
+            return _BwdPlan(80, c.tile_m, c.tile_n, sm80=c)
     return None
 
 
@@ -500,27 +537,27 @@ def _get_bwd(
             mask_mod=mm,
             has_aux_tensors=n_aux > 0,
         )
-    stages = 2 if head_dim <= 64 else 1
+    c = plan.sm80
     return _bwd_kernel_cls(arch)(
         dtype,
         head_dim,
         head_dim_v,
         qhead_per_kvhead,
-        plan.tile_m,
-        plan.tile_n,
-        stages,  # num_stages_Q
-        stages,  # num_stages_dO
-        _BWD_NUM_THREADS,
+        c.tile_m,
+        c.tile_n,
+        c.num_stages,  # num_stages_Q
+        c.num_stages,  # num_stages_dO
+        c.num_threads,
         False,  # pack_gqa
         causal,
         local,
         False,  # SdP_swapAB
         False,  # dKV_swapAB
         False,  # dQ_swapAB
-        _BWD_ATOM_LAYOUT,  # AtomLayoutMSdP
-        _BWD_ATOM_LAYOUT,  # AtomLayoutNdKV
-        _BWD_ATOM_LAYOUT,  # AtomLayoutMdQ
-        V_in_regs=False,
+        c.AtomLayoutMSdP,
+        c.AtomLayoutNdKV,
+        c.AtomLayoutMdQ,
+        V_in_regs=c.V_in_regs,
         mask_mod=mm,
         has_aux_tensors=n_aux > 0,
     )
@@ -554,7 +591,10 @@ def _bwd_post_params(plan: _BwdPlan, arch: int, which: str) -> tuple:
             return 90, c.tile_m, threads, c.AtomLayoutMdQ, c.dQ_swapAB
         return 90, c.tile_n, c.num_wg * 128, c.AtomLayoutNdKV, c.dKV_swapAB
     layout_arch = arch if arch // 10 in (8, 12) else 120
-    return layout_arch, plan.tile_m, _BWD_NUM_THREADS, _BWD_ATOM_LAYOUT, False
+    c = plan.sm80
+    if which == "dq":
+        return layout_arch, c.tile_m, c.num_threads, c.AtomLayoutMdQ, False
+    return layout_arch, c.tile_n, c.num_threads, c.AtomLayoutNdKV, False
 
 
 @functools.cache
@@ -931,8 +971,7 @@ def _validate(cfg: AttnConfig, kind: str, q, k, v):
             f"FA4 {kind} kernel cannot run head_dim={head_dim}, head_dim_v={head_dim_v} "
             f"({q.dtype}) on sm_{arch}: tile does not fit the shared-memory budget "
             "or the head dims exceed what the kernel supports (<= 128 on "
-            "sm_8x/sm_10x, <= 256 on sm_90 and for the sm_12x forward; the "
-            "sm_12x backward fits up to 160)"
+            "sm_8x/sm_10x and for the sm_12x JVP, <= 256 on sm_90 and sm_12x)"
         )
     return dtype, head_dim, head_dim_v, ratio, arch
 

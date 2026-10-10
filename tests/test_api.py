@@ -82,8 +82,8 @@ def test_rejects_f32_on_cute():
 @pytest.mark.cuda
 def test_unsupported_head_dim_never_poisons_context():
     """head_dim 256: whether it fits is family- and device-dependent (the
-    sm80-family budget accommodates it on a B200; the tcgen05 wrapper and
-    sm120 budget reject it). The invariant is that flash_attn either raises
+    sm80 family and sm120's smaller tiles accommodate it; the tcgen05
+    wrapper rejects it). The invariant is that flash_attn either raises
     a clean ValueError or computes correctly — never a failed launch that
     poisons the CUDA context."""
     q, k, v = random_qkv(np.random.default_rng(0), 1, 64, 64, 1, 1, 256, dtype=jnp.bfloat16)
