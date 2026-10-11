@@ -123,12 +123,15 @@ class Result:
 
 
 class Runner:
-    def __init__(self, target: Target, run_id: str, tarball: bytes, args, out_dir: Path):
+    def __init__(self, target: Target, run_id: str, rev: str, tarball: bytes, args, out_dir: Path):
         self.t, self.run_id, self.tarball, self.args = target, run_id, tarball, args
         self.out = out_dir / target.name
         self.out.mkdir(parents=True, exist_ok=True)
         self.known_hosts = self.out / "known_hosts"
         self.res = Result(target.name)
+        # The shipped tree has no .git, so hatch-vcs can't derive a version;
+        # hand it one naming the commit (a PEP 440 local version).
+        self.version_env = f"SETUPTOOLS_SCM_PRETEND_VERSION=0+ci.g{rev.replace('-', '.')}"
         self.pod_id: str | None = None
         self.rate = 0.0
 
@@ -210,7 +213,7 @@ class Runner:
         self.ssh(
             "set -e; command -v git >/dev/null || (apt-get update -qq && apt-get install -y -qq git >/dev/null); "
             "curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null; "
-            "cd /work/fa4-jax && ~/.local/bin/uv sync -q --extra cu13 && "
+            f"cd /work/fa4-jax && {self.version_env} ~/.local/bin/uv sync -q --extra cu13 && "
             "nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader",
             timeout=1800,
         )
@@ -218,7 +221,7 @@ class Runner:
     def test(self) -> int:
         pytest_args = " ".join(shlex.quote(a) for a in self.args.pytest_args)
         cmd = (
-            "cd /work/fa4-jax && ~/.local/bin/uv run pytest tests -q -p no:cacheprovider "
+            f"cd /work/fa4-jax && {self.version_env} ~/.local/bin/uv run pytest tests -q -p no:cacheprovider "
             f"--junitxml=/work/junit.xml {pytest_args} > /work/pytest.log 2>&1; "
             "echo $? > /work/pytest.rc"
         )
@@ -323,7 +326,7 @@ def main():
     targets = [TARGETS[t] for t in (args.only or DEFAULT_TARGETS)]
     print(f"run {run_id} @ {rev}: {', '.join(t.name for t in targets)} -> {out}")
 
-    runners = [Runner(t, run_id, tarball, args, out) for t in targets]
+    runners = [Runner(t, run_id, rev, tarball, args, out) for t in targets]
     threads = [threading.Thread(target=r.run, name=r.t.name) for r in runners]
     for th in threads:
         th.start()
