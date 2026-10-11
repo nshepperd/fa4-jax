@@ -7,6 +7,14 @@ import os
 os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "cuda_async")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.2")
 
+# XLA's GPU autotuning (picking the fastest GEMM algorithm for the reference
+# implementation's fusions) was ~90% of XLA compile time and the bulk of a
+# cold run: 36 forward tests went 131 s -> 50 s with it off, 90 s -> 9 s of
+# backend compile (phenex sm_120, empty cache). Algorithm choice doesn't
+# matter for an oracle. An explicit xla_gpu_autotune_level in XLA_FLAGS wins.
+if "xla_gpu_autotune_level" not in os.environ.get("XLA_FLAGS", ""):
+    os.environ["XLA_FLAGS"] = (os.environ.get("XLA_FLAGS", "") + " --xla_gpu_autotune_level=0").strip()
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -16,8 +24,10 @@ import pytest
 # oracle would be noisier than the kernels it judges.
 jax.config.update("jax_default_matmul_precision", "highest")
 
-# The slowest part of tests seems to autotuning the xla reference impl
-jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache_fa4")
+# Persistent compile cache for repeat local runs (with autotuning off, a cold
+# run costs little more than a warm one). FA4_JAX_CACHE_DIR points it
+# elsewhere, e.g. an empty dir to measure a cold run.
+jax.config.update("jax_compilation_cache_dir", os.environ.get("FA4_JAX_CACHE_DIR", "/tmp/jax_cache_fa4"))
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
@@ -30,10 +40,21 @@ def has_cuda() -> bool:
         return False
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--compile-timing", action="store_true",
+        help="report where compile time goes (cutejax builds vs XLA); see _compile_timing.py",
+    )
+
+
 def pytest_configure(config):
     config.addinivalue_line(
         "markers", "cuda: needs a CUDA device (touches the cute backend)"
     )
+    if config.getoption("--compile-timing"):
+        import _compile_timing
+
+        config.pluginmanager.register(_compile_timing, "compile_timing")
 
 
 def pytest_collection_modifyitems(config, items):
