@@ -130,11 +130,15 @@ generation means running the suite on each kind of hardware.
 
 ## Releasing
 
-Tags drive the version (hatch-vcs). Before tagging, run the GPU suite on
-the generations no local machine has (Hopper, datacenter Blackwell) via
-rented RunPod pods, with the API key injected by keyward:
+Tags drive the version (hatch-vcs). Before tagging, check the generations
+no local machine has (Hopper, datacenter Blackwell). First for free:
+`ci/cross_compile.py` builds every kernel for sm_90a/sm_100a on any GPU box
+without launching anything, which catches tracing and compile errors (e.g. a
+new cutlass-dsl changing an API). Then the real suite on rented RunPod pods,
+with the API key injected by keyward:
 
 ```sh
+uv run python ci/cross_compile.py 90 && uv run python ci/cross_compile.py 100
 kw run -e RUNPOD_API_KEY=RUNPOD_API_KEY -- python3 ci/runpod_ci.py
 git tag v0.2.0 && git push origin v0.2.0
 ```

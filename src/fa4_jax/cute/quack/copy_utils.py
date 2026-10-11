@@ -1,6 +1,7 @@
 # Vendored from quack-kernels 0.6.4 (Dao-AILab/quack, Apache-2.0; see
 # LICENSE.quack at the repo root). Modified by fa4-jax: imports point at the vendored copies; `sr_cvt_copy` (stochastic
-# rounding, needs quack.rounding, unused by fa4-jax) removed.
+# rounding, needs quack.rounding, unused by fa4-jax) removed; register-tensor
+# `.to()` and `[..., i]` indexing replaced for cutlass >= 4.8.
 # Copyright (c) 2025-2026, QuACK team.
 
 from typing import Any, Optional, Type, Tuple, Callable, Sequence
@@ -118,6 +119,14 @@ def _tmem_copy_reg_tv_layout(tiled_copy: cute.TiledCopy):
     raise TypeError(f"Cannot infer tmem copy direction from tiled_copy.op={op}")
 
 
+def _convert_rmem(src: cute.Tensor, dtype, *, loc=None, ip=None) -> cute.Tensor:
+    """fa4-jax: `src.to(dtype)` on a register tensor, for cutlass >= 4.8 (where
+    only TensorSSA has `.to`): load, convert, store into a fresh fragment."""
+    out = cute.make_fragment_like(src, dtype, loc=loc, ip=ip)
+    out.store(src.load(loc=loc, ip=ip).to(dtype, loc=loc, ip=ip), loc=loc, ip=ip)
+    return out
+
+
 @dsl_user_op
 def cvt_copy(
     tiled_copy: cute.TiledCopy,
@@ -132,7 +141,7 @@ def cvt_copy(
 ) -> None:
     assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
     if const_expr(src.element_type != dst.element_type):
-        src = src.to(dst.element_type, loc=loc, ip=ip)
+        src = _convert_rmem(src, dst.element_type, loc=loc, ip=ip)
     if const_expr(retile):
         src = tiled_copy.retile(src)
     cute.copy(tiled_copy, src, dst, pred=pred, loc=loc, ip=ip, **kwargs)
@@ -197,7 +206,7 @@ def cvt_copy_pair_xor_sts32(
 
     assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
     if const_expr(src.element_type != dst.element_type):
-        src = src.to(dst.element_type, loc=loc, ip=ip)
+        src = _convert_rmem(src, dst.element_type, loc=loc, ip=ip)
     assert const_expr(dst.element_type.width == 32)
     src_flat = cute.make_tensor(src.iterator, cute.flatten(src.layout))
     dst_flat = cute.make_tensor(dst.iterator, cute.flatten(dst.layout))
@@ -630,7 +639,12 @@ def get_smem_store_C(
         tRS_sC = partition_D_position_independent(thr_copy, sC)
 
     def copy_fn(src: cute.Tensor, dst_idx: Optional[Int32] = None, fence=False, **new_kwargs):
-        dst_tensor = tRS_sC if const_expr(dst_idx is None) else tRS_sC[..., dst_idx]
+        # fa4-jax: cutlass >= 4.8 rejects `...` in a coordinate; spell the
+        # leading modes out as None.
+        dst_tensor = (
+            tRS_sC if const_expr(dst_idx is None)
+            else tRS_sC[(None,) * (cute.rank(tRS_sC) - 1) + (dst_idx,)]
+        )
         cvt_copy(tiled_copy, src, dst_tensor, retile=True, **new_kwargs)
         if const_expr(fence):
             cute.arch.fence_view_async_shared()
