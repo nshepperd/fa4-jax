@@ -12,7 +12,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
-from quack import copy_utils
+from fa4_jax.cute.quack import copy_utils
 
 # Import data structures from block_sparsity
 from fa4_jax.cute.block_sparsity import BlockSparseTensors

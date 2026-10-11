@@ -31,7 +31,7 @@ from cutlass.utils import ClcDynamicPersistentTileScheduler
 from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
-from quack import copy_utils, layout_utils
+from fa4_jax.cute.quack import copy_utils, layout_utils
 
 from fa4_jax.cute.copy_utils import create_ragged_tensor_for_tma, offset_ragged_tensor
 
@@ -56,7 +56,7 @@ from fa4_jax.cute import mma_sm100_desc as sm100_desc
 from fa4_jax.cute import blackwell_helpers as sm100_utils
 from fa4_jax.cute.named_barrier import NamedBarrierFwdSm100
 from cutlass.cute import FastDivmodDivisor
-from quack.cute_dsl_utils import ParamsBase
+from fa4_jax.cute.quack.cute_dsl_utils import ParamsBase
 from fa4_jax.cute.tile_scheduler import (
     SchedulerState,
     SchedulingMode,

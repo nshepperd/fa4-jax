@@ -24,7 +24,7 @@ from cutlass.cutlass_dsl import (
 )
 from cutlass.utils.hardware_info import HardwareInfo
 
-from quack.cute_dsl_utils import ParamsBase
+from fa4_jax.cute.quack.cute_dsl_utils import ParamsBase
 
 import fa4_jax.cute.utils as utils
 from fa4_jax.cute.fast_math import clz

@@ -47,7 +47,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
-from quack import layout_utils
+from fa4_jax.cute.quack import layout_utils
 
 from fa4_jax.cute import ampere_helpers as sm80_utils
 from fa4_jax.cute import utils

@@ -17,9 +17,9 @@ from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.base_dsl.arch import Arch
 
-from quack import copy_utils
-from quack import layout_utils
-from quack import sm90_utils
+from fa4_jax.cute.quack import copy_utils
+from fa4_jax.cute.quack import layout_utils
+from fa4_jax.cute.quack import sm90_utils
 
 from fa4_jax.cute.copy_utils import create_ragged_tensor_for_tma, offset_ragged_tensor
 from fa4_jax.cute.cute_dsl_utils import assume_tensor_aligned
@@ -37,7 +37,7 @@ from fa4_jax.cute import pipeline as pipeline_custom
 from fa4_jax.cute.pack_gqa import PackGQA, pack_gqa_layout, make_packgqa_tiled_tma_atom
 from fa4_jax.cute.paged_kv import PagedKVManager
 from fa4_jax.cute.named_barrier import NamedBarrierFwd
-from quack.cute_dsl_utils import ParamsBase
+from fa4_jax.cute.quack.cute_dsl_utils import ParamsBase
 from fa4_jax.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,

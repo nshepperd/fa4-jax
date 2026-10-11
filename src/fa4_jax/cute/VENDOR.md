@@ -143,3 +143,18 @@ reproduced in `fa4_jax/kernels.py`.
 Diff against `flash_attn/cute/` of a newer flash-attn-4 wheel, re-apply the
 changes above (git log this directory for their exact shape), and re-run the
 GPU test suite.
+
+## quack (`quack/`)
+
+The kernels' `quack` imports (`copy_utils`, `layout_utils`, `sm90_utils`,
+`utils`, and `ParamsBase` from `cute_dsl_utils`) now point at a vendored
+subset of quack-kernels 0.6.4 (Dao-AILab/quack, Apache-2.0 — see
+`LICENSE.quack` at the repo root) in `fa4_jax/cute/quack/`, with imports
+rewritten. Vendored rather than depended on because quack-kernels pins
+`nvidia-cutlass-dsl==4.6.2` (cutejax needs >= 4.8, so a PyPI install couldn't
+resolve; this repo only got away with it via a uv override) and requires
+torch, which `quack.cute_dsl_utils` also imported at module level. Changes,
+also noted in each file's header: `cute_dsl_utils.py` is cut down to the
+TVM-FFI `Constexpr` converter patch (kept: importing it was a side effect the
+kernels may rely on) and `ParamsBase`, dropping torch; `copy_utils.py` drops
+`sr_cvt_copy` (stochastic rounding, needs `quack.rounding`, unused here).

@@ -1,28 +1,30 @@
 [project]
 name = "fa4-jax"
-version = "0.1.0"
+dynamic = ["version"]
 description = "FlashAttention-4 (CuTeDSL) for JAX: fwd/bwd/jvp with flex-attention mask mods, via cutejax"
 readme = "README.md"
+# Our code is MIT; the vendored kernels keep their upstream licenses:
+# flash-attention (src/fa4_jax/cute/) BSD-3-Clause, quack's helpers
+# (src/fa4_jax/cute/quack/) Apache-2.0.
+license = "MIT AND BSD-3-Clause AND Apache-2.0"
+license-files = ["LICENSE", "LICENSE.flash-attention", "LICENSE.quack"]
+authors = [{ name = "Emily Shepperd", email = "nshepperd@gmail.com" }]
 requires-python = ">=3.12"
 dependencies = [
     "jax>=0.8.0",
     "jaxtyping",
     "cutejax>=0.1.3",
-    # The vendored flash_attn.cute kernels import quack's copy/layout helpers.
-    "quack-kernels",
     "nvidia-cutlass-dsl>=4.7",
 ]
+
+[project.urls]
+Repository = "https://github.com/nshepperd/fa4-jax"
 
 [project.optional-dependencies]
 # GPU runtime: jax with CUDA plus the CuTe DSL CUDA runtime libraries. CPU-only
 # installs (reference backend, unit tests) don't need either.
 cu12 = ["jax[cuda12]"]
 cu13 = ["jax[cuda13]", "nvidia-cutlass-dsl[cu13]>=4.7.0"]
-
-[tool.uv]
-# flash-attn-4's cutlass pin doesn't apply here (we vendor the kernels), but
-# quack-kernels may pin an older cutlass-dsl; the kernels run fine on 4.7+.
-override-dependencies = ["nvidia-cutlass-dsl>=4.7"]
 
 [dependency-groups]
 dev = [
@@ -45,7 +47,13 @@ explicit = true
 
 [build-system]
 build-backend = "hatchling.build"
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/fa4_jax/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fa4_jax"]

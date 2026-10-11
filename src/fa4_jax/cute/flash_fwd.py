@@ -20,8 +20,8 @@ import cutlass.utils as utils_basic
 from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
-from quack import copy_utils
-from quack import layout_utils
+from fa4_jax.cute.quack import copy_utils
+from fa4_jax.cute.quack import layout_utils
 
 from fa4_jax.cute import ampere_helpers as sm80_utils
 from fa4_jax.cute.cute_dsl_utils import assume_tensor_aligned

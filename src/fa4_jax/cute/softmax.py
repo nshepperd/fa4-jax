@@ -9,9 +9,9 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Boolean
 
-from quack import layout_utils
+from fa4_jax.cute.quack import layout_utils
 import fa4_jax.cute.utils as utils
-from quack.cute_dsl_utils import ParamsBase
+from fa4_jax.cute.quack.cute_dsl_utils import ParamsBase
 from fa4_jax.cute.seqlen_info import SeqlenInfoQK
 from fa4_jax.cute.utils import AuxData
 

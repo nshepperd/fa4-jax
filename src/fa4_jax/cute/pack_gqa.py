@@ -8,7 +8,7 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
 
 
-from quack import layout_utils
+from fa4_jax.cute.quack import layout_utils
 import fa4_jax.cute.utils as utils
 
 

@@ -7,7 +7,7 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass import Int32, const_expr
 
 from fa4_jax.cute import utils
-from quack.cute_dsl_utils import ParamsBase
+from fa4_jax.cute.quack.cute_dsl_utils import ParamsBase
 from cutlass.cute import FastDivmodDivisor
 
 import math

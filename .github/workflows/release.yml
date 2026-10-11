@@ -1,0 +1,71 @@
+name: Release
+
+# Push a tag like v0.2.0 to release: hatch-vcs derives the package version
+# from the tag, the wheel + sdist go to PyPI (trusted publishing), then a
+# GitHub release is created with them attached. Run the GPU suite first
+# (ci/runpod_ci.py, see the README) -- nothing here runs the tests.
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # hatch-vcs needs the full history and tags to compute the version
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v10.0.1
+      - run: uv build
+      - name: Check the built version matches the tag
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          ls dist/
+          test -f "dist/fa4_jax-${version}-py3-none-any.whl" || {
+            echo "::error::no wheel for version ${version} -- hatch-vcs computed something else (tag not on this commit?)"
+            exit 1
+          }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/fa4-jax
+    permissions:
+      id-token: write  # OIDC for PyPI trusted publishing
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # create the release and upload its assets
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - name: Create GitHub release with the wheel and sdist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=""
+          case "${GITHUB_REF_NAME}" in *a*|*b*|*rc*|*dev*) prerelease="--prerelease" ;; esac
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag \
+            ${prerelease}

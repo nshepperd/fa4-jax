@@ -4,3 +4,4 @@ __pycache__/
 .pytest_cache/
 .hypothesis/
 ci-results/
+src/fa4_jax/_version.py

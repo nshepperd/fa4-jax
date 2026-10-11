@@ -12,10 +12,10 @@ from cutlass.cute import FastDivmodDivisor
 from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
-from quack import copy_utils
-from quack import layout_utils
-from quack import sm90_utils
-from quack.sm90_utils import gemm_zero_init, gemm_w_idx
+from fa4_jax.cute.quack import copy_utils
+from fa4_jax.cute.quack import layout_utils
+from fa4_jax.cute.quack import sm90_utils
+from fa4_jax.cute.quack.sm90_utils import gemm_zero_init, gemm_w_idx
 
 from fa4_jax.cute.copy_utils import create_ragged_tensor_for_tma, offset_ragged_tensor
 from fa4_jax.cute.cute_dsl_utils import assume_tensor_aligned
@@ -24,7 +24,7 @@ from fa4_jax.cute.mask import AttentionMask
 from fa4_jax.cute.seqlen_info import SeqlenInfoQK
 from fa4_jax.cute.block_info import BlockInfo
 from fa4_jax.cute import pipeline
-from quack.cute_dsl_utils import ParamsBase
+from fa4_jax.cute.quack.cute_dsl_utils import ParamsBase
 from fa4_jax.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,

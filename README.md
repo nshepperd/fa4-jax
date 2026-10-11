@@ -3,7 +3,11 @@
 FlashAttention-4 (Tri Dao's CuTe DSL kernels) as a JAX library, for the
 SM80/SM120 family (Ampere → consumer Blackwell), SM90 (Hopper: H100/H200,
 via the wgmma + TMA kernels) and SM100 (datacenter Blackwell: B200/GB200,
-via the tcgen05 kernels), built on [cutejax](../cutejax).
+via the tcgen05 kernels), built on [cutejax](https://github.com/nshepperd/cutejax).
+
+```sh
+pip install "fa4-jax[cu13]"   # jax[cuda13] + the CuTe DSL's CUDA 13 runtime libraries
+```
 
 What it provides over `jax.nn.dot_product_attention`:
 
@@ -123,3 +127,25 @@ generation means running the suite on each kind of hardware.
 
 `conftest.py` sets `XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async` and
 `XLA_PYTHON_CLIENT_MEM_FRACTION=0.2` so the suite shares the GPU.
+
+## Releasing
+
+Tags drive the version (hatch-vcs). Before tagging, run the GPU suite on
+the generations no local machine has (Hopper, datacenter Blackwell) via
+rented RunPod pods, with the API key injected by keyward:
+
+```sh
+kw run -e RUNPOD_API_KEY=RUNPOD_API_KEY -- python3 ci/runpod_ci.py
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The tag push runs `.github/workflows/release.yml`: build the wheel and sdist,
+publish to PyPI (trusted publishing), then create a GitHub release with both
+attached.
+
+## License
+
+fa4-jax's own code is MIT (`LICENSE`). The vendored kernels keep their
+upstream licenses: flash-attention's CuTe DSL kernels in `src/fa4_jax/cute/`
+are BSD-3-Clause (`LICENSE.flash-attention`), and quack's helpers in
+`src/fa4_jax/cute/quack/` are Apache-2.0 (`LICENSE.quack`).

@@ -5,7 +5,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
 
-from quack import copy_utils
+from fa4_jax.cute.quack import copy_utils
 
 # fa4-jax: the ragged (varlen TMA) offsets go through our copy_utils, whose
 # wraparound extents are runtime values. quack's build them as static ints,

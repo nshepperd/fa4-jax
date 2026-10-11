@@ -15,7 +15,7 @@ from cutlass import Int32
 from cutlass.cute import FastDivmodDivisor
 import cutlass.utils as utils_basic
 
-from quack import layout_utils
+from fa4_jax.cute.quack import layout_utils
 from fa4_jax.cute import ampere_helpers as sm80_utils
 from fa4_jax.cute.cute_dsl_utils import assume_tensor_aligned
 from fa4_jax.cute import utils
@@ -23,7 +23,7 @@ from fa4_jax.cute.mask import AttentionMask
 from fa4_jax.cute.softmax import call_score_mod, call_score_mod_bwd
 from fa4_jax.cute.seqlen_info import SeqlenInfoQK
 from fa4_jax.cute.block_info import BlockInfo
-from quack.cute_dsl_utils import ParamsBase
+from fa4_jax.cute.quack.cute_dsl_utils import ParamsBase
 from fa4_jax.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
 from fa4_jax.cute.block_sparsity import BlockSparseTensors
 from fa4_jax.cute.utils import AuxData

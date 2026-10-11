@@ -14,7 +14,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.pipeline import PipelineAsync
 
-from quack import layout_utils
+from fa4_jax.cute.quack import layout_utils
 from fa4_jax.cute import utils
 from fa4_jax.cute.cute_dsl_utils import assume_tensor_aligned
 from fa4_jax.cute import copy_utils
@@ -23,7 +23,7 @@ from fa4_jax.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
 from fa4_jax.cute.mask import AttentionMask
 from fa4_jax.cute.seqlen_info import SeqlenInfoQK
 from fa4_jax.cute.block_info import BlockInfo
-from quack.cute_dsl_utils import ParamsBase
+from fa4_jax.cute.quack.cute_dsl_utils import ParamsBase
 from fa4_jax.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,

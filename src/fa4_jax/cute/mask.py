@@ -9,7 +9,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass.cutlass_dsl import min as dsl_min
 
-from quack import layout_utils
+from fa4_jax.cute.quack import layout_utils
 import fa4_jax.cute.utils as utils
 from fa4_jax.cute.block_info import BlockInfo
 from fa4_jax.cute.seqlen_info import SeqlenInfoQK
