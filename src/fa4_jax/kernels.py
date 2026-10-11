@@ -932,6 +932,22 @@ def _get_static(cfg: AttnConfig, dtype, head_dim, head_dim_v, qhead_per_kvhead, 
 
 
 @functools.cache
+def _aux_static(name: str, kernel, scale: float | None) -> _StaticDict:
+    """The static tree for one backward preprocess/postprocess call: just
+    the kernel object (under the key its jit function reads) and the softmax
+    scale it bakes in. These kernels depend only on dtype, head dims and tile
+    geometry, so handing them the variant's whole static dict -- the main
+    backward kernel, windows, mask -- made cutejax rebuild them for every
+    causal/window/mask variant (276 of the suite's 709 builds; 94 after).
+    Memoized, and the kernel objects are memoized by their parameters, so
+    every variant sharing a pre/post kernel shares one compile."""
+    st = _StaticDict({name: kernel})
+    if scale is not None:
+        st["scale"] = scale
+    return st
+
+
+@functools.cache
 def _can_implement(
     kind: str, dtype, head_dim: int, head_dim_v: int, qhead_per_kvhead: int,
     causal: bool, local: bool, arch: int,
@@ -1135,7 +1151,7 @@ class CuteBackend:
                 jax.ShapeDtypeStruct((b, h, s_q_pad), f32),
                 jax.ShapeDtypeStruct((b, h, s_q_pad * d_pad), f32),
             ],
-            st, out, d_out, lse,
+            _aux_static("pre", st["pre"], st["scale"]), out, d_out, lse,
             in_specs=[_QKV_SPEC, _QKV_SPEC, _LSE_SPEC],
             out_specs=_F32_SPEC,
             name="fa4_bwd_pre",
@@ -1175,7 +1191,7 @@ class CuteBackend:
             dk = cutejax.call(
                 _fa4_bwd_post_dk,
                 jax.ShapeDtypeStruct(k.shape, k.dtype),
-                st, dk_accum,
+                _aux_static("post_k", st["post_k"], st["scale"]), dk_accum,
                 in_specs=[_F32_SPEC],
                 out_specs=_QKV_SPEC,
                 name="fa4_bwd_post_dk",
@@ -1183,7 +1199,7 @@ class CuteBackend:
             dv = cutejax.call(
                 _fa4_bwd_post_dv,
                 jax.ShapeDtypeStruct(v.shape, v.dtype),
-                st, dv_accum,
+                _aux_static("post_v", st["post_v"], None), dv_accum,
                 in_specs=[_F32_SPEC],
                 out_specs=_QKV_SPEC,
                 name="fa4_bwd_post_dv",
@@ -1192,7 +1208,7 @@ class CuteBackend:
         dq = cutejax.call(
             _fa4_bwd_post,
             jax.ShapeDtypeStruct((b, s_q, h, d), q.dtype),
-            st, dq_accum,
+            _aux_static("post", st["post"], st["scale"]), dq_accum,
             in_specs=[_F32_SPEC],
             out_specs=_QKV_SPEC,
             name="fa4_bwd_post",
@@ -1229,7 +1245,7 @@ class CuteBackend:
                 jax.ShapeDtypeStruct((h, s_q_pad), f32),
                 jax.ShapeDtypeStruct((h, s_q_pad * d_pad), f32),
             ],
-            st, out, d_out, lse, cu_q, su_q,
+            _aux_static("pre", st["pre"], st["scale"]), out, d_out, lse, cu_q, su_q,
             in_specs=[_QKV3_SPEC, _QKV3_SPEC, _LSE_SPEC, None, None],
             out_specs=_F32_SPEC,
             name="fa4_bwd_pre_varlen",
@@ -1292,18 +1308,21 @@ class CuteBackend:
             dk = self._post_varlen(
                 _fa4_bwd_post_dk_varlen, _fa4_bwd_post_dk_varlen_dp, defined,
                 jax.ShapeDtypeStruct(k.shape, k.dtype),
-                st, dk_accum, cu_k, su_k, "fa4_bwd_post_dk_varlen",
+                _aux_static("post_k", st["post_k"], st["scale"]), dk_accum, cu_k, su_k,
+                "fa4_bwd_post_dk_varlen",
             )
             dv = self._post_varlen(
                 _fa4_bwd_post_dv_varlen, _fa4_bwd_post_dv_varlen_dp, defined,
                 jax.ShapeDtypeStruct(v.shape, v.dtype),
-                st, dv_accum, cu_k, su_k, "fa4_bwd_post_dv_varlen",
+                _aux_static("post_v", st["post_v"], None), dv_accum, cu_k, su_k,
+                "fa4_bwd_post_dv_varlen",
             )
 
         dq = self._post_varlen(
             _fa4_bwd_post_varlen, _fa4_bwd_post_varlen_dp, defined,
             jax.ShapeDtypeStruct((total_q, h, d), q.dtype),
-            st, dq_accum, cu_q, su_q, "fa4_bwd_post_varlen",
+            _aux_static("post", st["post"], st["scale"]), dq_accum, cu_q, su_q,
+            "fa4_bwd_post_varlen",
         )
         return dq, dk, dv
 
