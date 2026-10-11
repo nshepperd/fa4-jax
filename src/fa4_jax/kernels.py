@@ -503,22 +503,32 @@ def _bwd_plan(
 
     - sm_100: the 1-CTA tcgen05 kernel takes head dims up to 128, but
       4.0.0b26's mixed-dims path (head_dim != head_dim_v) miscompiles (a tmem
-      layout division error), so those fall through to the SM80-MMA kernel.
+      layout division error), and its dQ reduction works in 32-column chunks
+      (asserts the 16-padded head dim is a multiple of 32, so hd 16/48 can't
+      build); those fall through to the SM80-MMA kernel.
     - sm_90: the wgmma kernel with upstream's config row for the head dim,
       when its SharedStorage fits the device (upstream's largest configs sit
       exactly at the 227 KB limit) and the config is legal (GQA needs equal
-      head dims); otherwise the SM80-MMA fallback.
+      head dims); otherwise the SM80-MMA fallback. The row above hd 192 is
+      upstream's hd256 config and only builds for head dims that are
+      multiples of 64 (hd 224 fails to partition its SMEM copy).
     - else the SM80-MMA kernel, with the first _bwd_cfgs_sm80 row whose
       SharedStorage fits the device.
     """
     import cutlass.utils as utils_basic
 
     smem = utils_basic.get_smem_capacity_in_bytes(f"sm_{arch}")
-    if arch // 10 == 10 and head_dim == head_dim_v and head_dim <= 128:
+    if (
+        arch // 10 == 10
+        and head_dim == head_dim_v
+        and head_dim <= 128
+        and _round_up(head_dim, 16) % 32 == 0
+    ):
         # No can_implement on the tcgen05 backward; the head-dim bound above
         # is its envelope and the constructor asserts the rest.
         return _BwdPlan(100, 128, 128)
-    if arch // 10 == 9:
+    big_ok = max(head_dim, head_dim_v) <= 192 or (head_dim % 64 == 0 and head_dim_v % 64 == 0)
+    if arch // 10 == 9 and big_ok:
         from fa4_jax.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
 
         c = _bwd_cfg_sm90(head_dim, head_dim_v, causal, local)
