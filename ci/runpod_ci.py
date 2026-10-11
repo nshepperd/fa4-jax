@@ -297,7 +297,7 @@ def main():
     ap.add_argument("--only", action="append", choices=sorted(TARGETS), help="run just these targets")
     ap.add_argument("--dirty", action="store_true", help="ship the working tree instead of HEAD")
     ap.add_argument("--cleanup", action="store_true", help="terminate stray fa4-ci-* pods and exit")
-    ap.add_argument("--max-minutes", type=float, default=90, help="per-pod hard limit (dead-man timer)")
+    ap.add_argument("--max-minutes", type=float, default=150, help="per-pod hard limit (dead-man timer)")
     ap.add_argument("--placement-rounds", type=int, default=5, help="capacity retry rounds (60s apart)")
     ap.add_argument("--ssh-key", default=os.path.expanduser("~/.ssh/id_claude"))
     ap.add_argument("--out", default="ci-results")
