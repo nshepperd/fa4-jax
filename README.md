@@ -82,70 +82,25 @@ band alignment uses the used lengths. Reverse mode runs the FA4 varlen
 backward and forward mode the fused varlen tangent kernel; `vmap` over a
 varlen call is rejected — the packing *is* the batch.
 
-Restrictions (kernel-side, all checked with clear errors): fp16/bf16, head_dim
-a multiple of 8 and ≤ 256 — on the 99 KB parts (sm_86/89, sm_120) via smaller
-tiles above 128 (64×64 forward, 64×32 backward); on sm_90 the tiles come from
-upstream's per-head-dim table and a config is rejected only when its shared
-memory doesn't fit. Two exceptions stay at ≤ 128: sm_100, where larger heads
-would need 2-CTA MMAs, i.e. cluster launches, which this wrapper doesn't do,
-and forward-mode (JVP), whose six tiles don't fit 99 KB beyond that — no cotangent
-through `lse` in reverse mode. GQA works in all three passes (the backward
-accumulates dK/dV in fp32 across the q heads of each kv head). On sm_100 the
-backward runs the tcgen05 kernel for equal head dims and falls back to the
-SM80-MMA kernel for mixed ones (which miscompile in upstream b26); on sm_90 it
-runs the wgmma kernel whenever upstream's config for the head dim fits (GQA
-there needs equal head dims) and otherwise the same SM80-MMA fallback. Mask
-mods work in all three passes — the SM80/SM120 backward's mask_mod support is
-a local addition to the vendored kernel (the SM90 and SM100 ones have it
-upstream).
-Combining
-causal/window_size with a mask_mod keeps the native band's KV-block skipping
-and runs the mod as a second masking pass over the visited tiles (also a
-local mask.py change; upstream's branch structure silently drops the mod in
-that combination). The mod itself can't skip blocks — that would need flex
-block sparsity, which is not wired up.
+## Supported hardware and limits
 
-## Layout
+- **GPUs**: Ampere and Ada (sm_80/86/89), Hopper (sm_90), datacenter Blackwell
+  (sm_100) and consumer Blackwell (sm_120). Each GPU runs the kernel family
+  written for it.
+- **dtypes**: fp16 and bf16.
+- **Head dims**: multiples of 8, up to 256 — except on datacenter Blackwell
+  (sm_100) and in forward mode (`jax.jvp`), where the limit is 128. `head_dim`
+  and `head_dim_v` may differ. Anything unsupported raises a clear
+  `ValueError` up front rather than failing inside CUDA.
+- **GQA** works in the forward, backward and forward-mode passes.
+- **Mask mods** work in all three passes and combine with
+  `causal`/`window_size`, which keep their block skipping. The mod itself
+  can't skip blocks yet (flex block sparsity isn't wired up), so a very
+  sparse mask still visits every tile.
+- **Not supported**: differentiating through the returned `lse` in reverse
+  mode (`return_lse=True` outputs are fine; forward mode handles them).
 
-- `src/fa4_jax/attention.py` — public API, custom primitives, jvp/transpose rules.
-- `src/fa4_jax/kernels.py` — the cute backend: cutejax plumbing around the kernels.
-- `src/fa4_jax/masks.py` — dual-backend `MaskMod` (one predicate, kernel codegen + jnp).
-- `src/fa4_jax/reference.py` — executable spec; ground truth for the tests.
-- `src/fa4_jax/cute/` — vendored `flash_attn.cute` (see its `VENDOR.md`) plus
-  our `flash_jvp.py` tangent kernel.
-
-## Tests
-
-```sh
-uv run pytest              # kernels vs the jnp reference (fwd/grad/jvp/masks) + API checks; needs a CUDA device
-```
-
-Kernel-facing tests run the device's own kernels: SM80-MMA on sm_8x and
-sm_12x, wgmma on sm_90, tcgen05 on sm_100 (the latter two backwards fall
-back to SM80-MMA for configs their native kernels can't take). Covering every
-generation means running the suite on each kind of hardware.
-
-`conftest.py` sets `XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async` and
-`XLA_PYTHON_CLIENT_MEM_FRACTION=0.2` so the suite shares the GPU.
-
-## Releasing
-
-Tags drive the version (hatch-vcs). Before tagging, check the generations
-no local machine has (Hopper, datacenter Blackwell). First for free:
-`ci/cross_compile.py` builds every kernel for sm_90a/sm_100a on any GPU box
-without launching anything, which catches tracing and compile errors (e.g. a
-new cutlass-dsl changing an API). Then the real suite on rented RunPod pods,
-with the API key injected by keyward:
-
-```sh
-uv run python ci/cross_compile.py 90 && uv run python ci/cross_compile.py 100
-kw run -e RUNPOD_API_KEY=RUNPOD_API_KEY -- python3 ci/runpod_ci.py
-git tag v0.2.0 && git push origin v0.2.0
-```
-
-The tag push runs `.github/workflows/release.yml`: build the wheel and sdist,
-publish to PyPI (trusted publishing), then create a GitHub release with both
-attached.
+Working on fa4-jax itself: see `DEVELOPING.md` and `RELEASE.md`.
 
 ## License
 

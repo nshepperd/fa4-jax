@@ -3,7 +3,7 @@ name: Release
 # Push a tag like v0.2.0 to release: hatch-vcs derives the package version
 # from the tag, the wheel + sdist go to PyPI (trusted publishing), then a
 # GitHub release is created with them attached. Run the GPU suite first
-# (ci/runpod_ci.py, see the README) -- nothing here runs the tests.
+# (see RELEASE.md) -- nothing here runs the tests.
 
 on:
   push:
